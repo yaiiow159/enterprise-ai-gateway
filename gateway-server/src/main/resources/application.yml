@@ -1,0 +1,66 @@
+server:
+  port: ${SERVER_PORT:8090}
+
+spring:
+  application:
+    name: ai-gateway
+  threads:
+    virtual:
+      # 整個網關的請求處理都跑在虛擬執行緒上：LLM 呼叫幾乎全是 I/O 等待，
+      # 阻塞式程式碼在這個模型下是正確且最直白的寫法
+      enabled: true
+
+gateway:
+  # 逾時要比 LLM 的正常生成時間寬鬆：長回應動輒數十秒
+  attempt-timeout: 60s
+
+  routing:
+    strategy: latency-aware
+    unknown-provider-assumption: 500ms
+
+  hedge:
+    # deferred：只有主要 Provider 超過自己的 p95 TTFT 才補發備援。
+    # 換成 immediate 會讓每個請求的成本乘上 max-attempts 倍。
+    policy: deferred
+    max-attempts: 2
+    fallback-delay: 800ms
+
+  providers:
+    # 本機開發預設指向假 Provider（見 tools/fake-provider）。
+    # 金鑰一律只從環境變數注入，設定檔不得出現任何金鑰字面值。
+    - name: fake-fast
+      base-url: ${FAKE_FAST_URL:http://localhost:9101}
+      model: fake-fast
+      context-window-tokens: 128000
+      max-output-tokens: 4096
+      input-micro-cents-per-token: 50
+      output-micro-cents-per-token: 150
+
+    - name: fake-slow
+      base-url: ${FAKE_SLOW_URL:http://localhost:9102}
+      model: fake-slow
+      context-window-tokens: 128000
+      max-output-tokens: 4096
+      input-micro-cents-per-token: 20
+      output-micro-cents-per-token: 60
+
+    - name: fake-flaky
+      base-url: ${FAKE_FLAKY_URL:http://localhost:9103}
+      model: fake-flaky
+      context-window-tokens: 128000
+      max-output-tokens: 4096
+      input-micro-cents-per-token: 10
+      output-micro-cents-per-token: 30
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    tags:
+      application: ai-gateway
+
+logging:
+  level:
+    io.aigateway: INFO

@@ -1,0 +1,18 @@
+global:
+  # 串流請求的指標變化很快，預設 15s 會把 TTFT 尖峰抹平
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: ai-gateway
+    metrics_path: /actuator/prometheus
+    static_configs:
+      # 應用以 java -jar 在宿主機執行時用 host.docker.internal；
+      # 若把應用也放進 compose，換成服務名稱即可
+      - targets: ["host.docker.internal:8090"]
+        labels:
+          application: ai-gateway

@@ -1,0 +1,12 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    # uid 要固定：儀表板 JSON 以 uid 參照資料來源，讓 Grafana 自動產生的話
+    # 每次重建都會變成不同的 uid，儀表板就會顯示「找不到資料來源」
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

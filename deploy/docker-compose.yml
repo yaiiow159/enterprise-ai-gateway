@@ -1,0 +1,164 @@
+# Enterprise AI Gateway 本機開發基礎設施
+#
+# 連接埠全部可用環境變數覆寫。預設值刻意避開這台機器上其他專案已占用的
+# 6379／9090／3000～3002（FlowSentinel 等），詳見 CLAUDE.md。
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+
+services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: aigw_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    command:
+      - redis-server
+      # 語意快取是可重建的資料，記憶體滿了淘汰即可，不要拒絕寫入
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: aigw_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: aigateway
+      POSTGRES_USER: aigateway
+      POSTGRES_PASSWORD: aigateway
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    healthcheck:
+      # 帶上 -d/-U：預設的 pg_isready 會用作業系統使用者，在這個映像裡會誤判
+      test: ["CMD-SHELL", "pg_isready -U aigateway -d aigateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: aigw_qdrant
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    healthcheck:
+      # Qdrant 的映像沒有 curl/wget，用它自帶的 CLI 探測
+      test: ["CMD", "/qdrant/qdrant", "--version"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # 三個個性不同的假 Provider。路由與對沖要驗證的正是「在不同延遲與可靠度下
+  # 會不會選對」，所以下游必須是可預期的——用真的 Provider 測不出這件事。
+  # ---------------------------------------------------------------------------
+  fake-fast:
+    image: node:22-alpine
+    container_name: aigw_fake_fast
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ../tools/fake-provider:/app:ro
+    command: ["node", "server.js"]
+    environment:
+      FAKE_NAME: fake-fast
+      FAKE_PORT: 9101
+      FAKE_TTFT_MS: 80
+      FAKE_TOKEN_DELAY_MS: 5
+    ports:
+      - "${FAKE_FAST_PORT:-9101}:9101"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:9101/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  fake-slow:
+    image: node:22-alpine
+    container_name: aigw_fake_slow
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ../tools/fake-provider:/app:ro
+    command: ["node", "server.js"]
+    environment:
+      FAKE_NAME: fake-slow
+      FAKE_PORT: 9102
+      # 首個 token 慢 1.5 秒：對沖有沒有生效，看的就是這個實例會不會輸掉
+      FAKE_TTFT_MS: 1500
+      FAKE_TOKEN_DELAY_MS: 20
+    ports:
+      - "${FAKE_SLOW_PORT:-9102}:9102"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:9102/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  fake-flaky:
+    image: node:22-alpine
+    container_name: aigw_fake_flaky
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ../tools/fake-provider:/app:ro
+    command: ["node", "server.js"]
+    environment:
+      FAKE_NAME: fake-flaky
+      FAKE_PORT: 9103
+      FAKE_TTFT_MS: 150
+      FAKE_TOKEN_DELAY_MS: 8
+      # 三成機率回 429，用來驗證熔斷與失敗切換
+      FAKE_ERROR_RATE: "0.3"
+      FAKE_ERROR_STATUS: 429
+    ports:
+      - "${FAKE_FLAKY_PORT:-9103}:9103"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:9103/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: aigw_prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "${PROMETHEUS_PORT:-9091}:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: aigw_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "${GRAFANA_PORT:-3003}:3000"
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12

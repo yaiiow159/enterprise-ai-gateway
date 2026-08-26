@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.aigateway</groupId>
+  <artifactId>ai-gateway-parent</artifactId>
+  <version>0.0.1-SNAPSHOT</version>
+  <packaging>pom</packaging>
+
+  <name>Enterprise AI Gateway</name>
+  <description>LLM 網關：多 Provider 路由、對沖、串流與成本治理</description>
+
+  <!--
+    刻意不繼承 spring-boot-starter-parent，改用 BOM import：
+    core 與 providers 是函式庫，不該連帶繼承 repackage 外掛與可執行 jar 的預設值。
+    代價是 -parameters 要自己開（見下方 compiler plugin），少了它 Spring 的
+    參數綁定與 @ConfigurationProperties 建構子綁定都會失效。
+  -->
+  <modules>
+    <module>gateway-core</module>
+    <module>gateway-providers</module>
+    <module>gateway-server</module>
+  </modules>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    <!--
+      虛擬執行緒（JEP 444）在 21 是正式功能，不需要 enable-preview。
+      Structured Concurrency 仍是 preview，因此正式路徑不使用它（見 CLAUDE.md）。
+    -->
+    <maven.compiler.release>21</maven.compiler.release>
+    <spring-boot.version>3.5.3</spring-boot.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+
+      <dependency>
+        <groupId>io.aigateway</groupId>
+        <artifactId>gateway-core</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.aigateway</groupId>
+        <artifactId>gateway-providers</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <configuration>
+          <parameters>true</parameters>
+        </configuration>
+      </plugin>
+    </plugins>
+
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-maven-plugin</artifactId>
+          <version>${spring-boot.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.2.5</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>
