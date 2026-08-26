@@ -50,18 +50,24 @@ public final class HedgingChatClient implements AutoCloseable {
     private final HedgePolicy hedgePolicy;
     private final Duration attemptTimeout;
     private final BudgetLedger budget;
+    private final Duration probeInterval;
+    private final double probeFailureThreshold;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
     public HedgingChatClient(ProviderRegistry registry,
                              RoutingStrategy routing,
                              HedgePolicy hedgePolicy,
                              Duration attemptTimeout,
-                             BudgetLedger budget) {
+                             BudgetLedger budget,
+                             Duration probeInterval,
+                             double probeFailureThreshold) {
         this.registry = registry;
         this.routing = routing;
         this.hedgePolicy = hedgePolicy;
         this.attemptTimeout = attemptTimeout;
         this.budget = budget;
+        this.probeInterval = probeInterval;
+        this.probeFailureThreshold = probeFailureThreshold;
     }
 
     /**
@@ -73,16 +79,25 @@ public final class HedgingChatClient implements AutoCloseable {
      * @throws ProviderException 所有候選都失敗、錯誤本身不值得重試，或已達每日成本上限
      */
     public ChatStream stream(ChatRequest request) {
-        List<LlmProvider> candidates = orderedCandidates(request);
+        Candidates candidates = orderedCandidates(request);
 
         // 用最貴的候選估算：對沖或失敗切換可能落到任何一家，低估會讓上限形同虛設
-        long estimate = candidates.stream()
+        long estimate = candidates.ordered().stream()
                 .mapToLong(provider -> provider.capability().estimatedCostMicroCents(request))
                 .max().orElse(0);
         BudgetLedger.Reservation reservation = budget.reserve(request.tenant(), estimate);
 
         try {
-            return new BudgetedChatStream(dispatch(request, candidates), budget, reservation);
+            ChatStream winner = dispatch(request, candidates.ordered());
+
+            // 探測成功：清掉失敗窗口讓它立刻回到正常排序。
+            // 不清的話，恢復時間會被 128 筆窗口拖到與故障時間完全不成比例
+            if (candidates.probedProvider() != null
+                    && candidates.probedProvider().equals(winner.providerName())) {
+                log.info("半開探測成功，{} 恢復正常排序", winner.providerName());
+                registry.statsFor(winner.providerName()).clearFailures();
+            }
+            return new BudgetedChatStream(winner, budget, reservation);
         } catch (RuntimeException error) {
             // 一個 token 都沒產生，預扣全額退回
             budget.settle(reservation, 0);
@@ -179,13 +194,42 @@ public final class HedgingChatClient implements AutoCloseable {
                 Duration.ofNanos(System.nanoTime() - startedAt).toMillis());
     }
 
-    private List<LlmProvider> orderedCandidates(ChatRequest request) {
-        List<LlmProvider> candidates = registry.candidatesFor(request);
-        if (candidates.isEmpty()) {
+    /**
+     * 排序候選，並在需要時安插一次半開探測。
+     *
+     * <p>探測被放到**第一位**而不是尾巴：放尾巴的話只有在前面全部失敗時才會被呼叫，
+     * 那不是探測，是等別人也壞掉。放第一位的代價是探測失敗時使用者多等一次失敗切換，
+     * 而失敗切換本來就會兜住——這正是那個機制存在的理由。
+     */
+    private Candidates orderedCandidates(ChatRequest request) {
+        List<LlmProvider> available = registry.candidatesFor(request);
+        if (available.isEmpty()) {
             throw new ProviderException("routing", ProviderException.Kind.BAD_REQUEST, 400,
                     "沒有 Provider 能承接這個請求（檢查上下文長度、串流支援與 maxTokens）", null);
         }
-        return routing.order(request, candidates, registry);
+
+        List<LlmProvider> ordered = new ArrayList<>(routing.order(request, available, registry));
+
+        // 只有在還有別的候選可以兜底時才探測：唯一的候選本來就會被呼叫，
+        // 不需要探測，而且那時候「探測失敗」就等於「請求失敗」
+        if (ordered.size() > 1) {
+            for (int index = 1; index < ordered.size(); index++) {
+                LlmProvider candidate = ordered.get(index);
+                ProviderStats stats = registry.statsFor(candidate.name());
+                if (stats.tryClaimProbe(probeInterval, probeFailureThreshold)) {
+                    log.info("半開探測：{}（失敗率 {}）暫時提到第一位，失敗時由失敗切換兜住",
+                            candidate.name(), String.format("%.0f%%", stats.failureRate() * 100));
+                    ordered.remove(index);
+                    ordered.add(0, candidate);
+                    return new Candidates(ordered, candidate.name());
+                }
+            }
+        }
+        return new Candidates(ordered, null);
+    }
+
+    /** @param probedProvider 這次被安插的探測對象；null 表示沒有探測 */
+    private record Candidates(List<LlmProvider> ordered, String probedProvider) {
     }
 
     private Future<?> launch(LlmProvider provider,

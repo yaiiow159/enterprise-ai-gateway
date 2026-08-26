@@ -17,6 +17,11 @@ gateway:
   routing:
     strategy: latency-aware
     unknown-provider-assumption: 500ms
+    # 半開探測：降級中的 Provider 每隔這段時間拿到一次機會。
+    # 沒有它的話，滾動窗口只解決了一半——恢復是可能的，但前提是「還會被選中」，
+    # 而排到墊底的 Provider 永遠不會被選中，暫時故障就變成永久除名。
+    probe-interval: 30s
+    probe-failure-threshold: 0.5
 
   hedge:
     # deferred：只有主要 Provider 超過自己的 p95 TTFT 才補發備援。
@@ -30,9 +35,11 @@ gateway:
     # （新端點忘了設上限、對沖被改成無條件、上游調價），
     # 但一個真的會攔截的每日上限能把損失限制在一天之內。
     #
-    # 目前是**單節點**的帳：多節點部署時實際總上限會是節點數的倍數，
-    # 要全域上限得把帳記在 Redis（見 CLAUDE.md 待釐清問題）。
     enabled: true
+    # memory 是單節點的帳；正式環境要用 redis，否則設定檔上的 $50
+    # 在三個節點上就是 $150（與熔斷器狀態同理）
+    backend: ${BUDGET_BACKEND:memory}
+    redis-uri: ${BUDGET_REDIS_URI:redis://localhost:6380}
     daily-limit-usd: 50
     per-tenant-daily-limit-usd: 10
 

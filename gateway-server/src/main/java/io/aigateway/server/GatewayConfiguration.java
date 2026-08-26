@@ -9,6 +9,7 @@ import io.aigateway.core.HedgingChatClient;
 import io.aigateway.core.InMemoryBudgetLedger;
 import io.aigateway.core.ModelCapability;
 import io.aigateway.core.ProviderRegistry;
+import io.aigateway.core.RedisBudgetLedger;
 import io.aigateway.core.RoutingStrategy;
 import io.aigateway.providers.OpenAiCompatibleProvider;
 import io.micrometer.core.instrument.Gauge;
@@ -98,13 +99,22 @@ public class GatewayConfiguration {
             return BudgetLedger.disabled();
         }
 
-        log.info("每日成本上限：全域 ${}，單一租戶 ${}",
-                budget.getDailyLimitUsd(), budget.getPerTenantDailyLimitUsd());
+        log.info("每日成本上限：全域 ${}，單一租戶 ${}（後端 {}）",
+                budget.getDailyLimitUsd(), budget.getPerTenantDailyLimitUsd(), budget.getBackend());
+
         // UTC：多節點在不同時區時，用本地時區會讓歸零時刻不一致而出現額度空窗
-        return new InMemoryBudgetLedger(
-                budget.dailyLimitMicroCents(),
-                budget.perTenantLimitMicroCents(),
-                Clock.systemUTC());
+        return switch (budget.getBackend()) {
+            case "redis" -> new RedisBudgetLedger(budget.getRedisUri(),
+                    budget.dailyLimitMicroCents(), budget.perTenantLimitMicroCents(), Clock.systemUTC());
+            case "memory" -> {
+                // 單節點的帳。多節點下實際上限是節點數的倍數，這件事不能只寫在文件裡
+                log.warn("成本帳本使用行程記憶體：多節點部署時實際總上限會是「節點數 × ${}」。"
+                        + "正式環境請改用 gateway.budget.backend=redis", budget.getDailyLimitUsd());
+                yield new InMemoryBudgetLedger(budget.dailyLimitMicroCents(),
+                        budget.perTenantLimitMicroCents(), Clock.systemUTC());
+            }
+            default -> throw new IllegalArgumentException("未知的成本帳本後端：" + budget.getBackend());
+        };
     }
 
     /**
@@ -135,7 +145,9 @@ public class GatewayConfiguration {
                                         BudgetLedger budgetLedger,
                                         GatewayProperties properties) {
         return new HedgingChatClient(registry, routing, hedgePolicy,
-                properties.getAttemptTimeout(), budgetLedger);
+                properties.getAttemptTimeout(), budgetLedger,
+                properties.getRouting().getProbeInterval(),
+                properties.getRouting().getProbeFailureThreshold());
     }
 
     /** 讓設定裡的逾時可以寫成 3s／60s 這種可讀格式 */

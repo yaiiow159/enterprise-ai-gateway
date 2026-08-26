@@ -16,3 +16,7 @@ node_modules/
 .env
 .env.*
 !.env.example
+
+# release-check 的報告是每次執行的產物，沒有長期價值。
+# docs/benchmark/ 則要進版控——效能數字必須附上產生它的環境與參數才能被檢驗
+docs/release-check/

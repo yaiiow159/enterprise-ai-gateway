@@ -72,10 +72,14 @@ function killGateway() {
     child = null;
 }
 
-async function restartGateway() {
+async function restartGateway(extraEnv) {
     killGateway();
     await sleep(1500);
-    child = spawn('java', ['-jar', JAR], { stdio: 'ignore', detached: false });
+    child = spawn('java', ['-jar', JAR], {
+        stdio: 'ignore',
+        detached: false,
+        env: Object.assign({}, process.env, extraEnv || {}),
+    });
     for (let i = 0; i < 90; i++) {
         try {
             const health = await request(GATEWAY, 'GET', '/actuator/health');
@@ -261,6 +265,42 @@ async function scenarioStreamingIncremental() {
         `首個事件 ${ttft}ms，最後一個 ${last}ms，分佈區間 ${last - ttft}ms`);
 }
 
+async function scenarioProbeRecovery() {
+    console.log('\n[9] 降級的 Provider 應該靠半開探測恢復，而不是被永久除名');
+    // 探測間隔縮短到 5 秒，否則這個情境要等 30 秒
+    await restartGateway({ GATEWAY_ROUTING_PROBEINTERVAL: '5s' });
+    await resetFakes({});
+
+    await chat();                                  // fake-fast 是主要 Provider
+    await request(FAKES['fake-fast'], 'PUT', '/_fake/config', { errorRate: 1, errorStatus: 503 });
+    for (let i = 0; i < 6; i++) await chat();      // 連續失敗 → 降級到墊底
+
+    await request(FAKES['fake-fast'], 'PUT', '/_fake/config', { errorRate: 0, ttftMs: 60 });
+    const healed = (await fakeStats())['fake-fast'].requests;
+    for (let i = 0; i < 3; i++) await chat();      // 這一輪只排定探測時間，還不會探
+    const quarantined = (await fakeStats())['fake-fast'].requests;
+
+    check('康復後短期內確實沒有流量（這正是要解決的症狀）',
+        quarantined === healed,
+        `請求數 ${healed} → ${quarantined}`);
+
+    await sleep(6000);
+    const response = await chat();
+    const probed = (await fakeStats())['fake-fast'].requests;
+
+    check('探測放行一次並由它服務',
+        probed > quarantined && response.body?.x_gateway?.provider === 'fake-fast',
+        `請求數 ${quarantined} → ${probed}，服務者 ${response.body?.x_gateway?.provider}`);
+
+    // 恢復後不一定是主要 Provider——那取決於實測延遲，而它的樣本數還不足。
+    // 要驗的是「不再被隔離」：主要 Provider 一倒，它就該立刻被啟用
+    await request(FAKES['fake-slow'], 'PUT', '/_fake/config', { errorRate: 1, errorStatus: 503 });
+    const failoverResponse = await chat();
+    check('恢復後重新成為可用候選',
+        failoverResponse.body?.x_gateway?.provider === 'fake-fast',
+        `主要 Provider 失敗後由 ${failoverResponse.body?.x_gateway?.provider} 接手`);
+}
+
 // ---------- 主流程 ----------
 
 (async () => {
@@ -273,6 +313,7 @@ async function scenarioStreamingIncremental() {
         await scenarioLoserNotPenalised();
         await scenarioCancellation();
         await scenarioStreamingIncremental();
+        await scenarioProbeRecovery();
     } catch (error) {
         console.error('\n驗證中斷:', error.message);
         results.push({ name: '驗證流程本身', passed: false, detail: error.message });

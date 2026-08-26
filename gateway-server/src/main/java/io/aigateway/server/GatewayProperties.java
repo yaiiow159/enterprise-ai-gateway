@@ -108,10 +108,24 @@ public class GatewayProperties {
         /** 尚無統計樣本時假設的 TTFT，用於排序新加入的 Provider */
         private Duration unknownProviderAssumption = Duration.ofMillis(500);
 
+        /**
+         * 降級中的 Provider 多久放行一次半開探測。
+         *
+         * <p>太短會把流量倒回還沒好的上游，太長則讓短暫故障拖成長時間降級。
+         * 30 秒是個折衷：一次探測失敗的代價只是一次失敗切換的延遲。
+         */
+        private Duration probeInterval = Duration.ofSeconds(30);
+        /** 失敗率超過這個比例才算降級、才需要探測 */
+        private double probeFailureThreshold = 0.5;
+
         public String getStrategy() { return strategy; }
         public void setStrategy(String strategy) { this.strategy = strategy; }
         public Duration getUnknownProviderAssumption() { return unknownProviderAssumption; }
         public void setUnknownProviderAssumption(Duration value) { this.unknownProviderAssumption = value; }
+        public Duration getProbeInterval() { return probeInterval; }
+        public void setProbeInterval(Duration probeInterval) { this.probeInterval = probeInterval; }
+        public double getProbeFailureThreshold() { return probeFailureThreshold; }
+        public void setProbeFailureThreshold(double v) { this.probeFailureThreshold = v; }
     }
 
     public static class Hedge {
@@ -142,6 +156,20 @@ public class GatewayProperties {
      */
     public static class Budget {
         private boolean enabled = true;
+        /**
+         * memory 或 redis。
+         *
+         * <p>memory 是**單節點**的帳：多節點部署時實際總上限會是節點數的倍數。
+         * 正式環境用 redis，否則設定檔上的 $50 在三個節點上就是 $150。
+         */
+        private String backend = "memory";
+        private String redisUri = "redis://localhost:6380";
+
+        public String getBackend() { return backend; }
+        public void setBackend(String backend) { this.backend = backend; }
+        public String getRedisUri() { return redisUri; }
+        public void setRedisUri(String redisUri) { this.redisUri = redisUri; }
+
         /** 全域每日上限（美元）。0 表示不限 */
         private double dailyLimitUsd = 50;
         /** 單一租戶的每日上限（美元）。0 表示不限 */
