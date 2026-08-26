@@ -189,6 +189,63 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         assert(arrivals[0] > 700, `設定未生效，TTFT 為 ${arrivals[0]}ms`);
     });
 
+    // ---- 嵌入 ----
+    // 這幾項守的是「替身要忠實」：不忠實的替身讓測試看起來有跑，實際上什麼都沒驗。
+    // 開發時就踩到——handleEmbeddings 一開始忽略 body.model，於是
+    //「用 v1 建索引、用 v2 查詢」的測試兩邊其實是同一個模型，相似度當然一樣高。
+
+    const embed = async (input, model) => {
+        const response = await request({
+            method: 'POST', path: '/v1/embeddings', body: { model, input },
+        });
+        const payload = JSON.parse(response.body);
+        return { model: payload.model, vectors: payload.data.map((item) => item.embedding), usage: payload.usage };
+    };
+    const cosine = (a, b) => a.reduce((sum, value, index) => sum + value * b[index], 0);
+
+    const DOCUMENT = 'rate limit uses a token bucket refilled at a fixed rate';
+    const RELATED = 'token bucket rate limit';
+    const UNRELATED = 'virtual thread blocks without consuming a platform pool thread';
+
+    await check('/v1/embeddings 回傳 OpenAI 格式與正確維度', async () => {
+        const { vectors, usage } = await embed([DOCUMENT, RELATED]);
+        assert(vectors.length === 2, `回傳 ${vectors.length} 筆，預期 2`);
+        assert(vectors[0].length === config.embeddingDimension,
+            `維度 ${vectors[0].length}，預期 ${config.embeddingDimension}`);
+        assert(usage && usage.prompt_tokens > 0, 'usage 缺少 prompt_tokens');
+    });
+
+    await check('相關文字的相似度明顯高於無關文字（recall 才有意義）', async () => {
+        const { vectors } = await embed([DOCUMENT, RELATED, UNRELATED]);
+        const near = cosine(vectors[0], vectors[1]);
+        const far = cosine(vectors[0], vectors[2]);
+        assert(near > far + 0.3, `相關 ${near.toFixed(3)} 與無關 ${far.toFixed(3)} 區分度不足`);
+    });
+
+    await check('body.model 決定用哪個模型，換模型會換掉整個向量空間', async () => {
+        const first = await embed([DOCUMENT], 'fake-embed-v1');
+        const same = await embed([RELATED], 'fake-embed-v1');
+        const other = await embed([RELATED], 'fake-embed-v2');
+
+        assert(other.model === 'fake-embed-v2', `回應回報的模型是 ${other.model}`);
+        const consistent = cosine(first.vectors[0], same.vectors[0]);
+        const mismatched = cosine(first.vectors[0], other.vectors[0]);
+        assert(consistent > 0.7, `同模型相似度只有 ${consistent.toFixed(3)}`);
+        assert(mismatched < consistent / 2,
+            `換模型後相似度仍有 ${mismatched.toFixed(3)}（同模型 ${consistent.toFixed(3)}）——`
+            + 'body.model 可能沒有生效');
+    });
+
+    await check('嵌入也會回報成本（真 Provider 不回時要能靠 omitUsage 模擬）', async () => {
+        const withUsage = await embed([DOCUMENT]);
+        assert(withUsage.usage.estimated_cost_cents > 0, '嵌入沒有回報成本');
+
+        await request({ method: 'PUT', path: '/_fake/config', body: { omitUsage: true } });
+        const without = await embed([DOCUMENT]);
+        await request({ method: 'PUT', path: '/_fake/config', body: { omitUsage: false } });
+        assert(without.usage === undefined, 'omitUsage 時 usage 欄位仍然存在');
+    });
+
     await request({ method: 'POST', path: '/_fake/reset' });
 
     const failed = results.filter((entry) => !entry.ok).length;

@@ -51,6 +51,12 @@ const DEFAULTS = {
      * 替身該模擬的是真貨的**限制**，不只是它的能力。
      */
     omitUsage: String(process.env.FAKE_OMIT_USAGE || 'false') === 'true',
+    /** 嵌入模型名稱。換名字就等於換模型：維度相同、空間不同 */
+    embeddingModel: process.env.FAKE_EMBEDDING_MODEL || 'fake-embed-v1',
+    /** 嵌入維度。可以刻意設成與 collection 不符來驗證啟動檢查 */
+    embeddingDimension: Number(process.env.FAKE_EMBEDDING_DIM || 32),
+    /** 嵌入呼叫的延遲。檢索讓 TTFT 增加多少，靠它才量得出來 */
+    embeddingLatencyMs: Number(process.env.FAKE_EMBEDDING_LATENCY_MS || 20),
     /** 模擬價格，用於驗證成本歸戶（單位：每百萬 token 的美分）*/
     inputCentsPerMillion: Number(process.env.FAKE_INPUT_CENTS || 50),
     outputCentsPerMillion: Number(process.env.FAKE_OUTPUT_CENTS || 150),
@@ -61,6 +67,7 @@ let config = { ...DEFAULTS };
 const stats = {
     requests: 0,
     streamingRequests: 0,
+    embeddingRequests: 0,
     errors: 0,
     /** 客戶端在串流結束前斷線的次數。網關有沒有把取消往上游傳，就看這個數字 */
     cancelled: 0,
@@ -109,6 +116,9 @@ function effectiveConfig(request) {
         errorRate: request.headers['x-fake-error'] !== undefined ? 1 : config.errorRate,
         abortAfterTokens: header('abort-after-tokens', config.abortAfterTokens),
         omitUsage: request.headers['x-fake-omit-usage'] !== undefined || config.omitUsage,
+        embeddingModel: request.headers['x-fake-embedding-model'] || config.embeddingModel,
+        embeddingDimension: header('embedding-dim', config.embeddingDimension),
+        embeddingLatencyMs: header('embedding-latency-ms', config.embeddingLatencyMs),
     };
 }
 
@@ -257,12 +267,112 @@ function usage(promptTokens, completionTokens, settings) {
     };
 }
 
+// ---------------------------------------------------------------- 嵌入
+
+/**
+ * 詞袋嵌入。**這不是真的模型**，是一個行為可預測的替身。
+ *
+ * 關鍵是它要有真實模型的一個性質：**共用詞越多越相似**。
+ * 用隨機或雜湊向量的話 recall@k 會是隨機值，那樣就無法斷言檢索有沒有壞掉——
+ * 而「檢索悄悄壞掉但照樣回結果」正是 RAG 最典型的失效方式。
+ *
+ * `embeddingModel` 決定「詞 → 維度」的映射。換一個名字就等於換一個模型：
+ * **維度完全相同、只是空間不同**。這正是最危險的那種不一致——維度對得上所以不報錯，
+ * 查詢照常回傳最近鄰，只是全部不相關。
+ */
+const VOCABULARY = [
+    'retry', 'timeout', 'circuit', 'breaker', 'rate', 'limit', 'token', 'bucket',
+    'stream', 'cancel', 'upstream', 'provider', 'hedge', 'latency', 'cost', 'budget',
+    'embedding', 'vector', 'index', 'recall', 'cache', 'semantic', 'prompt', 'model',
+    'virtual', 'thread', 'block', 'pool', 'router', 'failover', 'metric', 'quantile',
+];
+
+function vocabularyMapping(model) {
+    let seed = 0;
+    for (const character of String(model)) seed = (seed * 31 + character.charCodeAt(0)) >>> 0;
+
+    const indices = VOCABULARY.map((unused, index) => index);
+    // 以模型名稱為種子的 Fisher-Yates；不用 Math.random 才能重現
+    for (let i = indices.length - 1; i > 0; i -= 1) {
+        seed = (seed * 1103515245 + 12345) >>> 0;
+        const j = seed % (i + 1);
+        [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+    return new Map(VOCABULARY.map((word, index) => [word, indices[index]]));
+}
+
+function embed(text, settings) {
+    const mapping = vocabularyMapping(settings.embeddingModel);
+    const vector = new Array(settings.embeddingDimension).fill(0);
+
+    for (const word of String(text).toLowerCase().split(/[^a-z]+/)) {
+        const index = mapping.get(word);
+        // 維度被設得比詞彙表小時，落在範圍外的詞就丟掉——
+        // 這也是刻意的：可以用它模擬「維度設錯」的情況
+        if (index !== undefined && index < vector.length) vector[index] += 1;
+    }
+
+    const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
+    return norm > 0 ? vector.map((value) => value / norm) : vector;
+}
+
+async function handleEmbeddings(request, response) {
+    const body = await readBody(request);
+    const settings = effectiveConfig(request);
+
+    stats.requests += 1;
+    stats.embeddingRequests += 1;
+
+    if (settings.errorRate > 0 && Math.random() < settings.errorRate) {
+        stats.errors += 1;
+        sendJson(response, settings.errorStatus, errorPayload(settings.errorStatus));
+        return;
+    }
+
+    const inputs = Array.isArray(body.input) ? body.input : [body.input ?? ''];
+
+    // 以請求指定的模型為準，設定值只是預設——真 Provider 就是靠 body.model 選模型的。
+    // 一開始漏了這一行，結果「用 v1 建索引、用 v2 查詢」的測試看起來有跑，
+    // 實際上兩邊都用同一個模型，相似度當然一樣高。**替身不忠實，測試就是假的。**
+    const model = body.model || settings.embeddingModel;
+    const effective = { ...settings, embeddingModel: model };
+
+    // 嵌入也要花時間。沒有延遲的話「檢索讓 TTFT 變慢多少」就量不出來
+    await sleep(settings.embeddingLatencyMs);
+
+    const promptTokens = inputs.reduce((sum, text) => sum + Math.max(1, Math.ceil(String(text).length / 4)), 0);
+    stats.promptTokens += promptTokens;
+
+    sendJson(response, 200, {
+        object: 'list',
+        model,
+        data: inputs.map((text, index) => ({
+            object: 'embedding',
+            index,
+            embedding: embed(text, effective),
+        })),
+        // 與 chat 一致：真 Provider 不回 estimated_cost_cents，omitUsage 時整個 usage 都不出現
+        ...(settings.omitUsage ? {} : {
+            usage: {
+                prompt_tokens: promptTokens,
+                total_tokens: promptTokens,
+                estimated_cost_cents: promptTokens * settings.inputCentsPerMillion / 1_000_000,
+            },
+        }),
+    });
+}
+
 const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://localhost:${PORT}`);
 
     try {
         if (request.method === 'POST' && url.pathname === '/v1/chat/completions') {
             await handleChatCompletion(request, response);
+            return;
+        }
+
+        if (request.method === 'POST' && url.pathname === '/v1/embeddings') {
+            await handleEmbeddings(request, response);
             return;
         }
 
