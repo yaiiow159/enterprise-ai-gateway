@@ -25,6 +25,17 @@ gateway:
     max-attempts: 2
     fallback-delay: 800ms
 
+  budget:
+    # 每日成本上限，最後一道防線。上面所有防護都可能被繞過
+    # （新端點忘了設上限、對沖被改成無條件、上游調價），
+    # 但一個真的會攔截的每日上限能把損失限制在一天之內。
+    #
+    # 目前是**單節點**的帳：多節點部署時實際總上限會是節點數的倍數，
+    # 要全域上限得把帳記在 Redis（見 CLAUDE.md 待釐清問題）。
+    enabled: true
+    daily-limit-usd: 50
+    per-tenant-daily-limit-usd: 10
+
   providers:
     # 本機開發預設指向假 Provider（見 tools/fake-provider）。
     # 金鑰一律只從環境變數注入，設定檔不得出現任何金鑰字面值。

@@ -49,25 +49,48 @@ public final class HedgingChatClient implements AutoCloseable {
     private final RoutingStrategy routing;
     private final HedgePolicy hedgePolicy;
     private final Duration attemptTimeout;
+    private final BudgetLedger budget;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
     public HedgingChatClient(ProviderRegistry registry,
                              RoutingStrategy routing,
                              HedgePolicy hedgePolicy,
-                             Duration attemptTimeout) {
+                             Duration attemptTimeout,
+                             BudgetLedger budget) {
         this.registry = registry;
         this.routing = routing;
         this.hedgePolicy = hedgePolicy;
         this.attemptTimeout = attemptTimeout;
+        this.budget = budget;
     }
 
     /**
      * 串流呼叫。回傳的串流已經含有第一個 chunk（判定勝負時必然要先讀一段）。
      *
-     * @throws ProviderException 所有候選都失敗，或錯誤本身不值得換一家重試
+     * <p>成本上限在**送出任何請求之前**就先預扣：等到收到回應才發現超支，
+     * 那筆錢已經花掉了。預扣用 {@code maxTokens} 估最壞情況，實際成本出來後結算差額。
+     *
+     * @throws ProviderException 所有候選都失敗、錯誤本身不值得重試，或已達每日成本上限
      */
     public ChatStream stream(ChatRequest request) {
         List<LlmProvider> candidates = orderedCandidates(request);
+
+        // 用最貴的候選估算：對沖或失敗切換可能落到任何一家，低估會讓上限形同虛設
+        long estimate = candidates.stream()
+                .mapToLong(provider -> provider.capability().estimatedCostMicroCents(request))
+                .max().orElse(0);
+        BudgetLedger.Reservation reservation = budget.reserve(request.tenant(), estimate);
+
+        try {
+            return new BudgetedChatStream(dispatch(request, candidates), budget, reservation);
+        } catch (RuntimeException error) {
+            // 一個 token 都沒產生，預扣全額退回
+            budget.settle(reservation, 0);
+            throw error;
+        }
+    }
+
+    private ChatStream dispatch(ChatRequest request, List<LlmProvider> candidates) {
         ProviderStats primaryStats = registry.statsFor(candidates.get(0).name());
 
         AtomicBoolean settled = new AtomicBoolean();

@@ -1,13 +1,18 @@
 package io.aigateway.server;
 
+import java.time.Clock;
 import java.time.Duration;
 
+import io.aigateway.core.BudgetLedger;
 import io.aigateway.core.HedgePolicy;
 import io.aigateway.core.HedgingChatClient;
+import io.aigateway.core.InMemoryBudgetLedger;
 import io.aigateway.core.ModelCapability;
 import io.aigateway.core.ProviderRegistry;
 import io.aigateway.core.RoutingStrategy;
 import io.aigateway.providers.OpenAiCompatibleProvider;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.binder.MeterBinder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
@@ -77,12 +82,60 @@ public class GatewayConfiguration {
         };
     }
 
+    /**
+     * 每日成本上限，最後一道防線。
+     *
+     * <p>關閉時**大聲說出來**：一個沒有成本上限的 LLM 網關，任何一個失控的迴圈、
+     * 忘了設 maxTokens 的端點、或被誤設成無條件對沖的策略，都會一路燒到有人發現為止。
+     * 這件事不該只存在於設定檔的某一行裡。
+     */
+    @Bean
+    BudgetLedger budgetLedger(GatewayProperties properties) {
+        GatewayProperties.Budget budget = properties.getBudget();
+        if (!budget.isEnabled()) {
+            log.warn("每日成本上限已停用：失控的請求不會被任何機制擋下來。"
+                    + "只有在外部已有成本控制時才該這樣設定。");
+            return BudgetLedger.disabled();
+        }
+
+        log.info("每日成本上限：全域 ${}，單一租戶 ${}",
+                budget.getDailyLimitUsd(), budget.getPerTenantDailyLimitUsd());
+        // UTC：多節點在不同時區時，用本地時區會讓歸零時刻不一致而出現額度空窗
+        return new InMemoryBudgetLedger(
+                budget.dailyLimitMicroCents(),
+                budget.perTenantLimitMicroCents(),
+                Clock.systemUTC());
+    }
+
+    /**
+     * 把今日支出與上限輸出成指標。
+     *
+     * <p>**看不見的上限只有一半用處**：撞到上限那一刻服務就開始回 429，
+     * 但真正需要的是在撞牆之前就看得到「今天已經花了七成」。
+     * 沒有這個指標，成本上限就從一道防線退化成一個突然的故障。
+     *
+     * <p>指標放在 server 模組而不是 core：core 刻意不依賴 Spring 與 Micrometer。
+     */
+    @Bean
+    MeterBinder budgetMetrics(BudgetLedger ledger) {
+        return registry -> {
+            Gauge.builder("gateway.budget.spent.microcents", ledger, value -> value.spentMicroCents(null))
+                    .description("今日已花費（微美分，UTC 日）")
+                    .register(registry);
+            Gauge.builder("gateway.budget.limit.microcents", ledger, BudgetLedger::dailyLimitMicroCents)
+                    .description("每日成本上限（微美分）；0 表示未設限")
+                    .register(registry);
+        };
+    }
+
     @Bean(destroyMethod = "close")
     HedgingChatClient hedgingChatClient(ProviderRegistry registry,
                                         RoutingStrategy routing,
                                         HedgePolicy hedgePolicy,
+                                        BudgetLedger budgetLedger,
                                         GatewayProperties properties) {
-        return new HedgingChatClient(registry, routing, hedgePolicy, properties.getAttemptTimeout());
+        return new HedgingChatClient(registry, routing, hedgePolicy,
+                properties.getAttemptTimeout(), budgetLedger);
     }
 
     /** 讓設定裡的逾時可以寫成 3s／60s 這種可讀格式 */

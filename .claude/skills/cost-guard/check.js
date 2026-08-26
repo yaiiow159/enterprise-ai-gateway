@@ -421,6 +421,65 @@ async function measureCancellationSaving() {
     }
 }
 
+/** 從 /actuator/prometheus 取一個 gauge 的值。取不到回 null，不猜 */
+function gauge(name) {
+    return new Promise((resolve) => {
+        const request = http.get({
+            host: 'localhost', port: GATEWAY_PORT, path: '/actuator/prometheus', timeout: 5000,
+        }, (response) => {
+            if (response.statusCode !== 200) { response.resume(); resolve(null); return; }
+            let text = '';
+            response.on('data', (chunk) => { text += chunk; });
+            response.on('end', () => {
+                const line = text.split('\n').find((row) => row.startsWith(name));
+                resolve(line ? Number(line.slice(line.lastIndexOf(' ') + 1)) : null);
+            });
+        });
+        request.on('timeout', () => { request.destroy(); resolve(null); });
+        request.on('error', () => resolve(null));
+    });
+}
+
+/**
+ * 每日成本上限有沒有真的在記帳。
+ *
+ * <p>靜態掃描只能確認「有攔截邏輯存在」，不能確認它接上了。
+ * 一個設定了上限卻沒接進請求路徑的帳本，跟沒有上限完全一樣——
+ * 而且更糟，因為儀表板上會顯示一個永遠是 0 的支出數字，看起來像一切正常。
+ */
+async function measureBudgetEnforcement() {
+    console.log('\n[執行期 4] 每日成本上限是否真的在記帳');
+
+    const limit = await gauge('gateway_budget_limit_microcents');
+    if (limit === null) {
+        report('警告', '找不到成本上限的指標',
+            'gateway_budget_limit_microcents 沒有出現在 /actuator/prometheus',
+            '確認 BudgetLedger 的 MeterBinder 有註冊；看不見的上限只有一半用處');
+        return;
+    }
+    if (limit === 0) {
+        report('阻擋', '成本上限設為 0（不限制）',
+            '任何失控的迴圈或誤設都不會被擋下來',
+            '設定 gateway.budget.daily-limit-usd');
+        return;
+    }
+
+    const before = await gauge('gateway_budget_spent_microcents');
+    await json(GATEWAY_PORT, 'POST', '/v1/chat/completions', {
+        model: 'any', messages: [{ role: 'user', content: '確認帳本有在記帳' }], max_tokens: 10,
+    });
+    const after = await gauge('gateway_budget_spent_microcents');
+
+    if (after !== null && before !== null && after > before) {
+        pass('帳本確實接在請求路徑上',
+            `一次請求後支出從 ${before} 增加到 ${after} 微美分，上限 ${limit}`);
+    } else {
+        report('阻擋', '請求沒有計入成本帳本',
+            `支出前後都是 ${before}——帳本存在但沒接上請求路徑`,
+            '一個永遠是 0 的支出數字比沒有數字更危險，因為它看起來像一切正常');
+    }
+}
+
 /**
  * 把量到的 token 用量換算成金額。
  *
@@ -428,7 +487,7 @@ async function measureCancellationSaving() {
  * 所以假設一定要跟著數字一起印出來，否則這個金額不可重現、也無法被檢驗。
  */
 function projectDailyCost(sample) {
-    console.log('\n[執行期 4] 換算成每日成本（推估）');
+    console.log('\n[執行期 5] 換算成每日成本（推估）');
     const { stats, sampleSize } = sample;
     const promptPerRequest = stats.promptTokens / sampleSize;
     const completionPerRequest = stats.completionTokens / sampleSize;
@@ -481,6 +540,7 @@ async function gatewayReachable() {
                 const sample = await measureCostMultiplier();
                 await measureMaxTokensHonoured();
                 await measureCancellationSaving();
+                await measureBudgetEnforcement();
                 projectDailyCost(sample);
             } finally {
                 await configureAll({ ttftMs: 100, tokenDelayMs: 8, tokens: 40 }).catch(() => {});

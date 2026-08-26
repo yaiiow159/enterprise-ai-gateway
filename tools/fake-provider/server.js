@@ -42,6 +42,15 @@ const DEFAULTS = {
     errorStatus: Number(process.env.FAKE_ERROR_STATUS || 500),
     /** 串流到第 N 個 token 後直接中斷連線；0 表示不中斷 */
     abortAfterTokens: Number(process.env.FAKE_ABORT_AFTER_TOKENS || 0),
+    /**
+     * 不回報 usage，模擬真實 Provider 的預設行為。
+     *
+     * OpenAI 的串流**預設不回** usage，要另外送 stream_options.include_usage 才有。
+     * 這個替身原本一律回報，比真貨慷慨——於是網關理所當然地依賴了那份慷慨，
+     * 接上真 Provider 後每一筆成本都會記成 0。
+     * 替身該模擬的是真貨的**限制**，不只是它的能力。
+     */
+    omitUsage: String(process.env.FAKE_OMIT_USAGE || 'false') === 'true',
     /** 模擬價格，用於驗證成本歸戶（單位：每百萬 token 的美分）*/
     inputCentsPerMillion: Number(process.env.FAKE_INPUT_CENTS || 50),
     outputCentsPerMillion: Number(process.env.FAKE_OUTPUT_CENTS || 150),
@@ -99,6 +108,7 @@ function effectiveConfig(request) {
         errorStatus: header('error-status', config.errorStatus),
         errorRate: request.headers['x-fake-error'] !== undefined ? 1 : config.errorRate,
         abortAfterTokens: header('abort-after-tokens', config.abortAfterTokens),
+        omitUsage: request.headers['x-fake-omit-usage'] !== undefined || config.omitUsage,
     };
 }
 
@@ -152,7 +162,7 @@ async function handleChatCompletion(request, response) {
             model,
             provider: settings.name,
             choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
-            usage: usage(promptTokens, totalTokens, settings),
+            ...(settings.omitUsage ? {} : { usage: usage(promptTokens, totalTokens, settings) }),
         });
         return;
     }
@@ -216,7 +226,8 @@ async function handleChatCompletion(request, response) {
         model,
         provider: settings.name,
         choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-        usage: usage(promptTokens, totalTokens, settings),
+        // omitUsage 時整個欄位不出現，模擬真實 Provider 的預設行為
+        ...(settings.omitUsage ? {} : { usage: usage(promptTokens, totalTokens, settings) }),
     })}\n\n`);
     response.write('data: [DONE]\n\n');
     response.end();

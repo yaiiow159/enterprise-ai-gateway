@@ -21,8 +21,18 @@ public class GatewayProperties {
 
     private Hedge hedge = new Hedge();
 
+    private Budget budget = new Budget();
+
     /** 單一候選的整體逾時 */
     private Duration attemptTimeout = Duration.ofSeconds(60);
+
+    public Budget getBudget() {
+        return budget;
+    }
+
+    public void setBudget(Budget budget) {
+        this.budget = budget;
+    }
 
     public List<ProviderConfig> getProviders() {
         return providers;
@@ -121,5 +131,31 @@ public class GatewayProperties {
         public void setMaxAttempts(int maxAttempts) { this.maxAttempts = maxAttempts; }
         public Duration getFallbackDelay() { return fallbackDelay; }
         public void setFallbackDelay(Duration fallbackDelay) { this.fallbackDelay = fallbackDelay; }
+    }
+
+    /**
+     * 每日成本上限。
+     *
+     * <p>金額用美元設定（人看的），內部一律換算成整數微美分（對帳用的）。
+     * 設成 0 表示不限制——而 {@code enabled} 預設為 true 且上限有預設值，
+     * 是刻意的：「沒有上限」應該要是一個明確的決定，不該是忘了設定的結果。
+     */
+    public static class Budget {
+        private boolean enabled = true;
+        /** 全域每日上限（美元）。0 表示不限 */
+        private double dailyLimitUsd = 50;
+        /** 單一租戶的每日上限（美元）。0 表示不限 */
+        private double perTenantDailyLimitUsd = 10;
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        public double getDailyLimitUsd() { return dailyLimitUsd; }
+        public void setDailyLimitUsd(double dailyLimitUsd) { this.dailyLimitUsd = dailyLimitUsd; }
+        public double getPerTenantDailyLimitUsd() { return perTenantDailyLimitUsd; }
+        public void setPerTenantDailyLimitUsd(double v) { this.perTenantDailyLimitUsd = v; }
+
+        /** 美元 → 微美分。整數運算，金額不用浮點數 */
+        public long dailyLimitMicroCents() { return Math.round(dailyLimitUsd * 100 * 1_000_000L); }
+        public long perTenantLimitMicroCents() { return Math.round(perTenantDailyLimitUsd * 100 * 1_000_000L); }
     }
 }

@@ -48,20 +48,26 @@ node .claude/skills/cost-guard/check.js --requests-per-day 50000 --price-output 
 **換算出來的金額是推估不是量測**：token 數是量到的，單價與日流量是假設，
 所以報告會把假設值一起印出來。沒有附上假設的「每天會花 X 元」不可重現，也就沒有意義。
 
-## 目前抓到的兩個真實缺口
+## 這支工具抓到並已修掉的兩個缺口
 
-**1. 沒有任何每日成本上限的攔截邏輯。**
-程式碼裡有三處註解假設它存在（`HedgePolicy` 說 immediate「必須有每日成本上限作為防線」、
+**1. 沒有任何每日成本上限的攔截邏輯。**（已修）
+程式碼裡曾有三處註解假設它存在（`HedgePolicy` 說 immediate「必須有每日成本上限作為防線」、
 `GatewayConfiguration` 啟動時警告「請確認已設定成本上限」），但沒有任何東西在執行它。
-在補上之前，`immediate` 對沖與任何自動重試都沒有防線兜底。
 
-**2. 成本歸戶接上真 Provider 會靜默記成 0。**
-`parseUsage` 只從 `estimated_cost_cents` 取成本，而那是假 Provider 才有的欄位。
-真 Provider 不回這個欄位時成本記成 0——不會報錯，只是帳目上永遠看起來免費。
-`ModelCapability` 已經有單價可以自行推算，只是沒有被用在這條路徑上。
+現在有 `BudgetLedger`：送出前預扣估算成本、實際成本出來後結算差額，
+超限回 429 且**完全不打到上游**。支出與上限也輸出成 Prometheus 指標。
+
+**2. 成本歸戶接上真 Provider 會靜默記成 0。**（已修）
+`parseUsage` 曾經只從 `estimated_cost_cents` 取成本，而那是假 Provider 才有的欄位。
+真 Provider 不回它時成本記成 0——不會報錯，只是帳目上永遠看起來免費。
 
 這是典型的「用測試替身開發」會產生的盲點：替身比真貨**多**回了一個欄位，
-於是程式碼理所當然地依賴它。替身該模擬的是真貨的限制，不只是它的能力。
+於是程式碼理所當然地依賴它。替身該模擬的是真貨的限制，不只是它的能力——
+所以 `fake-provider` 加了 `omitUsage` 設定，讓這條路徑測得到。
+
+**兩者的修復有先後關係**：先修成本歸戶，再做上限。
+反過來的話，上限會建在「每筆都記成 0」的帳上，變成一道永遠不會觸發的防線——
+那比沒有更糟，因為它看起來像有保護。
 
 ## 兩個 hook，兩種嚴格程度
 
@@ -86,6 +92,8 @@ node .claude/skills/cost-guard/check.js --requests-per-day 50000 --price-output 
 | 對沖改成 `immediate`（3 家） | 成本倍率 `1.00×` → `3.00×`，判為阻擋 |
 | 設定檔改成 `policy: immediate` | 靜態掃描出聲，`cost-scan` hook 跟著出聲 |
 | 不帶 `max_tokens` 直接打假 Provider | 產生 200 個 token（帶了則是 5），證明那條斷言在驗網關有沒有轉發 |
+| `GATEWAY_BUDGET_ENABLED=false` | 「上限是否真的在記帳」判為阻擋，啟動日誌也大聲警告 |
+| 上游設 `omitUsage`（模擬真 Provider）| 成本仍為非零（本地單價兜底），不是靜默的 0 |
 
 `secret-guard` 自己也有 `--self-test`，同時驗漏報與誤報兩個方向：
 

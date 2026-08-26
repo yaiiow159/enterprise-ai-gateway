@@ -45,7 +45,15 @@ public class ProviderException extends RuntimeException {
         AUTHENTICATION(false),
         CONTENT_FILTERED(false),
         /** 上游在串流中途斷線 */
-        STREAM_ABORTED(true);
+        STREAM_ABORTED(true),
+        /**
+         * 已達每日成本上限。
+         *
+         * <p>不可重試——換一家 Provider 一樣要花錢，額度是我們自己的，不是上游的。
+         * 這個分類存在的意義就是不讓它落進「5xx 就換一家再試」那條路徑，
+         * 否則超支時反而會把每個請求都打滿所有候選。
+         */
+        BUDGET_EXCEEDED(false);
 
         final boolean retryable;
 

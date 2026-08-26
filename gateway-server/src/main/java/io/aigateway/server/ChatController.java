@@ -216,6 +216,9 @@ public class ChatController {
     ResponseEntity<Map<String, Object>> handleProviderException(ProviderException error) {
         HttpStatus status = switch (error.kind()) {
             case RATE_LIMITED -> HttpStatus.TOO_MANY_REQUESTS;
+            // 額度用盡沿用 429：對客戶端而言「現在不要再送了」的處理方式是一樣的，
+            // 差別在 type 欄位（insufficient_quota），與 OpenAI 的語意一致
+            case BUDGET_EXCEEDED -> HttpStatus.TOO_MANY_REQUESTS;
             case AUTHENTICATION -> HttpStatus.UNAUTHORIZED;
             case BAD_REQUEST, CONTENT_FILTERED -> HttpStatus.BAD_REQUEST;
             case TIMEOUT -> HttpStatus.GATEWAY_TIMEOUT;

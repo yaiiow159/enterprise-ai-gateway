@@ -107,7 +107,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
                     name,
                     choice.path("message").path("content").asText(""),
                     finishReason(choice.path("finish_reason").asText(null)),
-                    parseUsage(root.path("usage")),
+                    parseUsage(root.path("usage"), capability, request.estimatedPromptTokens(), -1),
                     Duration.ofNanos(System.nanoTime() - startedAt).toMillis());
         } catch (IOException error) {
             throw new ProviderException(name, ProviderException.Kind.SERVER_ERROR, response.statusCode(),
@@ -130,7 +130,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
             throw toProviderException(response.statusCode(), body);
         }
 
-        return new SseChatStream(name, response.body());
+        return new SseChatStream(name, response.body(), capability, request.estimatedPromptTokens());
     }
 
     private HttpRequest buildRequest(ChatRequest request, boolean streaming) {
@@ -220,13 +220,45 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         };
     }
 
-    private static Usage parseUsage(JsonNode node) {
-        if (node.isMissingNode()) return Usage.EMPTY;
+    /**
+     * 解析用量並算出成本。
+     *
+     * <p><b>絕對不能回傳成本 0</b>。早期版本只讀 {@code estimated_cost_cents}——
+     * 而那是本專案假 Provider 才有的欄位，真的 Provider 不回它。後果是接上真 Provider
+     * 之後每一筆的成本都記成 0：不會報錯，帳目上永遠看起來免費，直到對帳的時候。
+     * 這也讓任何以成本為基礎的防線（每日上限、成本歸戶）全部失效，
+     * 因為它們看到的永遠是零。
+     *
+     * <p>所以有兩層兜底：
+     * <ol>
+     *   <li>上游沒回成本 → 用 {@link ModelCapability} 的單價自行推算。</li>
+     *   <li>上游連 usage 都沒回（**串流時很常見**，OpenAI 要另外送
+     *       {@code stream_options.include_usage} 才會給）→ 用本地估算的 token 數推算。</li>
+     * </ol>
+     *
+     * <p>估算會有誤差，但**估錯的成本遠小於記成零的成本**：前者是帳目偏差幾個百分點，
+     * 後者是防線完全不存在。
+     *
+     * @param promptEstimate   本地估算的輸入 token 數，上游沒給時使用
+     * @param completionCount  實際看到的輸出 chunk 數，上游沒給時使用；-1 表示不可用
+     */
+    private static Usage parseUsage(JsonNode node,
+                                    ModelCapability capability,
+                                    long promptEstimate,
+                                    long completionCount) {
         long prompt = node.path("prompt_tokens").asLong(0);
         long completion = node.path("completion_tokens").asLong(0);
-        // 假 Provider 會回這個欄位；真的 Provider 不會，成本由 ModelCapability 的單價推算
-        long costMicroCents = Math.round(node.path("estimated_cost_cents").asDouble(0) * 1_000_000);
-        return new Usage(prompt, completion, costMicroCents);
+
+        if (prompt <= 0 && promptEstimate > 0) prompt = promptEstimate;
+        if (completion <= 0 && completionCount >= 0) completion = completionCount;
+
+        long upstreamCost = Math.round(node.path("estimated_cost_cents").asDouble(0) * 1_000_000);
+        long cost = upstreamCost > 0
+                ? upstreamCost
+                : prompt * capability.inputMicroCentsPerToken()
+                        + completion * capability.outputMicroCentsPerToken();
+
+        return new Usage(prompt, completion, cost);
     }
 
     /**
@@ -240,12 +272,20 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         private final String providerName;
         private final InputStream source;
         private final BufferedReader reader;
+        private final ModelCapability capability;
+        private final long promptEstimate;
+
         private ChatChunk nextChunk;
         private boolean finished;
+        /** 上游有沒有自己回報用量。沒有的話結束前要補一個，否則這次呼叫的成本會是 0 */
+        private boolean usageReported;
+        private long contentChunks;
 
-        SseChatStream(String providerName, InputStream source) {
+        SseChatStream(String providerName, InputStream source, ModelCapability capability, long promptEstimate) {
             this.providerName = providerName;
             this.source = source;
+            this.capability = capability;
+            this.promptEstimate = promptEstimate;
             this.reader = new BufferedReader(new InputStreamReader(source, StandardCharsets.UTF_8));
         }
 
@@ -279,14 +319,22 @@ public class OpenAiCompatibleProvider implements LlmProvider {
 
                     if ("[DONE]".equals(payload)) {
                         finished = true;
-                        return null;
+                        // 上游沒回用量就自己補一個。少了這一步，串流請求的成本一律是 0，
+                        // 而每日成本上限看到的就永遠是零——一道不會觸發的防線
+                        return usageReported ? null : syntheticUsageChunk();
                     }
 
                     JsonNode root = MAPPER.readTree(payload);
                     JsonNode choice = root.path("choices").path(0);
                     String delta = choice.path("delta").path("content").asText("");
                     ChatChunk.FinishReason reason = finishReason(choice.path("finish_reason").asText(null));
-                    Usage usage = root.has("usage") ? parseUsage(root.path("usage")) : null;
+
+                    Usage usage = null;
+                    if (root.has("usage") && !root.path("usage").isNull()) {
+                        usage = parseUsage(root.path("usage"), capability, promptEstimate, contentChunks);
+                        usageReported = true;
+                    }
+                    if (!delta.isEmpty()) contentChunks += 1;
 
                     // 結束標記本身通常沒有內容，但帶著 usage，仍要往下傳
                     if (delta.isEmpty() && reason == null && usage == null) continue;
@@ -303,6 +351,22 @@ public class OpenAiCompatibleProvider implements LlmProvider {
             finished = true;
             throw new ProviderException(providerName, ProviderException.Kind.STREAM_ABORTED, 502,
                     "上游在送出結束標記前就關閉連線", null);
+        }
+
+        /**
+         * 上游沒回用量時，用本地估算補一個。
+         *
+         * <p>OpenAI 的串流預設**不回** usage，要另外送 {@code stream_options.include_usage}。
+         * 本專案的假 Provider 一律會回，所以這條路徑在假 Provider 上永遠走不到——
+         * 這正是測試替身造成的盲點：替身比真貨慷慨，程式碼就理所當然地依賴那份慷慨。
+         * 假 Provider 因此加了 {@code omitUsage} 設定來重現真貨的這個限制。
+         */
+        private ChatChunk syntheticUsageChunk() {
+            usageReported = true;
+            Usage estimated = parseUsage(MAPPER.createObjectNode(), capability, promptEstimate, contentChunks);
+            log.debug("{} 未回報用量，以本地估算補上：輸入 {}、輸出 {} token",
+                    providerName, estimated.promptTokens(), estimated.completionTokens());
+            return new ChatChunk("", null, estimated, providerName);
         }
 
         @Override
