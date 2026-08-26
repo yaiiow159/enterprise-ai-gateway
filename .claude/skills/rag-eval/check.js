@@ -157,9 +157,29 @@ function declaredEmbedding() {
     const yml = path.join(REPO_ROOT, 'gateway-server/src/main/resources/application.yml');
     if (!fs.existsSync(yml)) return null;
     const source = fs.readFileSync(yml, 'utf8');
-    const model = source.match(/embedding-model:\s*([\w./-]+)/);
-    const dimension = source.match(/embedding-dimension:\s*(\d+)/);
-    return model ? { model: model[1], dimension: dimension ? Number(dimension[1]) : null } : null;
+
+    const model = value(source, 'embedding-model');
+    const dimension = value(source, 'embedding-dimension');
+    return model ? { model, dimension: dimension ? Number(dimension) : null } : null;
+}
+
+/**
+ * 讀一個設定值，並解開 Spring 的 `${VAR:default}` 佔位語法。
+ *
+ * <p>不解開的話讀到的是字面上的 `${RAG_EMBEDDING_MODEL:fake-embed-v1}`，
+ * 拿它去跟 collection 記錄的模型比對必然不相等——而這支工具會把它報成
+ * 「設定中沒有宣告嵌入模型」，看起來像設定漏了，實際上是解析器看不懂。
+ *
+ * <p>取的是**預設值**，不是環境變數的實際值：環境變數只有跑起來才知道，
+ * 而這是一支靜態檢查。真正權威的比對在網關啟動時做（RagConfiguration）。
+ */
+function value(source, key) {
+    const line = source.match(new RegExp(`${key}:\\s*(.+)`));
+    if (!line) return null;
+
+    const raw = line[1].split('#')[0].trim();
+    const placeholder = raw.match(/^\$\{[^:}]+:([^}]*)\}$/);
+    return (placeholder ? placeholder[1] : raw).trim() || null;
 }
 
 /**

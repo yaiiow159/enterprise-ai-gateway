@@ -14,8 +14,12 @@ import io.aigateway.core.ChatStream;
 import io.aigateway.core.HedgingChatClient;
 import io.aigateway.core.Message;
 import io.aigateway.core.ProviderException;
+import io.aigateway.core.RagAugmenter;
+import io.aigateway.core.RagOptions;
+import io.aigateway.core.RetrievedDocument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -40,18 +44,60 @@ public class ChatController {
 
     private static final Logger log = LoggerFactory.getLogger(ChatController.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    /**
+     * 預扣嵌入成本時用的單價猜測（微美分／token）。
+     *
+     * 真實單價在 EmbeddingProvider 的設定裡，但預扣發生在呼叫之前、拿不到它。
+     * 取一個偏高的值：預扣估高只會讓額度暫時緊一點，實際成本出來後就結算退回；
+     * 估低則是讓上限漏掉一部分，方向不能反。
+     */
+    private static final long EMBEDDING_COST_PER_TOKEN_GUESS = 100;
 
     private final HedgingChatClient client;
+    /** 沒開啟 RAG 時為 null——沒有索引的檢索只會多付一次嵌入費用然後回傳空結果 */
+    private final RagAugmenter rag;
 
-    ChatController(HedgingChatClient client) {
+    ChatController(HedgingChatClient client, ObjectProvider<RagAugmenter> rag) {
         this.client = client;
+        this.rag = rag.getIfAvailable();
     }
 
     @PostMapping(path = "/v1/chat/completions", produces = MediaType.APPLICATION_JSON_VALUE)
     public Object chatCompletions(@RequestBody Map<String, Object> body,
                                   @RequestHeader(value = "X-Tenant", required = false) String tenant) {
         ChatRequest request = toChatRequest(body, tenant);
-        return request.stream() ? streamResponse(request) : ResponseEntity.ok(toOpenAiResponse(client.complete(request)));
+
+        // 檢索**必須在這裡**，也就是在 client 的成本預扣之前。
+        // 預扣用 estimatedPromptTokens() 估算，而檢索會往 prompt 塞進成千個 token；
+        // 先預扣再注入的話那些 token 完全沒被算進去，成本上限會系統性低估，
+        // 而且低估的比例正好隨檢索量成長。
+        RagAugmenter.RagResult retrieval = retrieve(body, request, tenant);
+        ChatRequest effective = retrieval == null ? request : retrieval.request();
+
+        return effective.stream()
+                ? streamResponse(effective, retrieval)
+                : ResponseEntity.ok(toOpenAiResponse(client.complete(effective), retrieval));
+    }
+
+    private RagAugmenter.RagResult retrieve(Map<String, Object> body, ChatRequest request, String tenant) {
+        RagOptions options = RagOptions.from(body, tenant, estimatedEmbeddingCost(request));
+        if (options == null) return null;
+        if (rag == null) {
+            throw new IllegalArgumentException(
+                    "請求帶了 x_rag，但這個網關沒有啟用檢索（gateway.rag.enabled=false）。"
+                            + "靜靜忽略它會讓呼叫端以為答案有依據");
+        }
+        return rag.augment(request, options);
+    }
+
+    /**
+     * 嵌入呼叫的成本估算，用於預扣。
+     *
+     * <p>查詢字串通常很短，但仍然要估——**不估就是記成 0**，
+     * 而那正是成本防線失效的起點。
+     */
+    private long estimatedEmbeddingCost(ChatRequest request) {
+        return Math.max(1, request.estimatedPromptTokens()) * EMBEDDING_COST_PER_TOKEN_GUESS;
     }
 
     /**
@@ -76,7 +122,7 @@ public class ChatController {
      *   <li>轉發要在**另一條虛擬執行緒**上跑，不要佔住請求執行緒。</li>
      * </ul>
      */
-    private SseEmitter streamResponse(ChatRequest request) {
+    private SseEmitter streamResponse(ChatRequest request, RagAugmenter.RagResult retrieval) {
         ChatStream upstream = client.stream(request);
 
         SseEmitter emitter = new SseEmitter(0L);
@@ -88,9 +134,15 @@ public class ChatController {
 
         Thread.ofVirtual().name("sse-relay-" + request.model()).start(() -> {
             try {
+                // 檢索資訊只放在第一個 chunk：每個 chunk 都塞會讓串流內容膨脹，
+                // 而呼叫端需要的是「這次回答依據了什麼」，那在開頭知道就夠了
+                boolean first = true;
                 while (upstream.hasNext()) {
                     ChatChunk chunk = upstream.next();
-                    emitter.send(SseEmitter.event().data(toOpenAiChunk(chunk, request), MediaType.APPLICATION_JSON));
+                    emitter.send(SseEmitter.event()
+                            .data(toOpenAiChunk(chunk, request, first ? retrieval : null),
+                                    MediaType.APPLICATION_JSON));
+                    first = false;
                 }
                 emitter.send(SseEmitter.event().data("[DONE]"));
                 emitter.complete();
@@ -120,6 +172,31 @@ public class ChatController {
         } catch (IOException ignored) {
             emitter.completeWithError(error);
         }
+    }
+
+    /**
+     * 回報這次回答依據了什麼。
+     *
+     * <p>三件事都要出去，因為它們對應三種不同的狀況：
+     * <ul>
+     *   <li><b>來源與分數</b>——分數普遍偏低代表「檢索到了但都不相關」，
+     *       那與「沒檢索到」是不同的問題，只看有沒有結果會把兩者混為一談。</li>
+     *   <li><b>degraded</b>——檢索失敗但依設定繼續，**這個答案沒有依據**。
+     *       不講的話呼叫端會把它當成有根據的回答，那是最糟的情況。</li>
+     *   <li><b>note</b>——沒有命中的原因。</li>
+     * </ul>
+     */
+    private Map<String, Object> ragSummary(RagAugmenter.RagResult retrieval) {
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("degraded", retrieval.degraded());
+        summary.put("documents", retrieval.documents().stream()
+                .map(document -> Map.<String, Object>of(
+                        "id", document.id(),
+                        "score", document.score()))
+                .toList());
+        summary.put("embedding_cost_micro_cents", retrieval.embeddingUsage().costMicroCents());
+        if (retrieval.note() != null) summary.put("note", retrieval.note());
+        return summary;
     }
 
     private void closeQuietly(ChatStream stream, AtomicBoolean closed) {
@@ -152,7 +229,7 @@ public class ChatController {
                 Map.of());
     }
 
-    private Map<String, Object> toOpenAiResponse(ChatResponse response) {
+    private Map<String, Object> toOpenAiResponse(ChatResponse response, RagAugmenter.RagResult retrieval) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("id", response.id());
         payload.put("object", "chat.completion");
@@ -166,14 +243,16 @@ public class ChatController {
                 "prompt_tokens", response.usage().promptTokens(),
                 "completion_tokens", response.usage().completionTokens(),
                 "total_tokens", response.usage().totalTokens()));
-        payload.put("x_gateway", Map.of(
-                "provider", response.providerName(),
-                "latency_ms", response.latencyMs(),
-                "cost_micro_cents", response.usage().costMicroCents()));
+        Map<String, Object> gateway = new LinkedHashMap<>();
+        gateway.put("provider", response.providerName());
+        gateway.put("latency_ms", response.latencyMs());
+        gateway.put("cost_micro_cents", response.usage().costMicroCents());
+        if (retrieval != null) gateway.put("rag", ragSummary(retrieval));
+        payload.put("x_gateway", gateway);
         return payload;
     }
 
-    private String toOpenAiChunk(ChatChunk chunk, ChatRequest request) {
+    private String toOpenAiChunk(ChatChunk chunk, ChatRequest request, RagAugmenter.RagResult retrieval) {
         try {
             Map<String, Object> delta = chunk.delta() == null || chunk.delta().isEmpty()
                     ? Map.of()
@@ -187,7 +266,10 @@ public class ChatController {
                     "index", 0,
                     "delta", delta,
                     "finish_reason", chunk.finishReason() == null ? "" : finishReason(chunk.finishReason())))));
-            payload.put("x_gateway", Map.of("provider", chunk.providerName()));
+            Map<String, Object> gateway = new LinkedHashMap<>();
+            gateway.put("provider", chunk.providerName());
+            if (retrieval != null) gateway.put("rag", ragSummary(retrieval));
+            payload.put("x_gateway", gateway);
             if (chunk.usage() != null) {
                 payload.put("usage", Map.of(
                         "prompt_tokens", chunk.usage().promptTokens(),

@@ -23,6 +23,16 @@ public class GatewayProperties {
 
     private Budget budget = new Budget();
 
+    private Rag rag = new Rag();
+
+    public Rag getRag() {
+        return rag;
+    }
+
+    public void setRag(Rag rag) {
+        this.rag = rag;
+    }
+
     /** 單一候選的整體逾時 */
     private Duration attemptTimeout = Duration.ofSeconds(60);
 
@@ -185,5 +195,58 @@ public class GatewayProperties {
         /** 美元 → 微美分。整數運算，金額不用浮點數 */
         public long dailyLimitMicroCents() { return Math.round(dailyLimitUsd * 100 * 1_000_000L); }
         public long perTenantLimitMicroCents() { return Math.round(perTenantDailyLimitUsd * 100 * 1_000_000L); }
+    }
+
+    /**
+     * 檢索增強。
+     *
+     * <p>預設關閉：沒有索引的 RAG 只會讓每個請求多付一次嵌入費用然後檢索到空結果。
+     * 要開之前先用 {@code tools/rag-index.js} 建索引。
+     */
+    public static class Rag {
+        private boolean enabled = false;
+        private String collection = "docs";
+        /** 索引與查詢必須是同一個模型。啟動時會拿它跟 collection 實際記錄的比對 */
+        private String embeddingModel = "fake-embed-v1";
+        private int embeddingDimension = 32;
+        private String embeddingBaseUrl = "http://localhost:9101";
+        private String embeddingApiKey = "";
+        private long embeddingInputMicroCentsPerToken = 50;
+        private String vectorStoreUrl = "http://localhost:6333";
+        private String vectorStoreApiKey = "";
+        /**
+         * 啟動時發現嵌入模型或維度不符就拒絕啟動。
+         *
+         * <p>**預設 true。** 不符卻照樣啟動的話，檢索會照常回傳最近鄰、只是全部不相關——
+         * 系統不報錯，只是變笨，而「RAG 效果不好」可以歸咎於一百種原因。
+         */
+        private boolean failOnMismatch = true;
+        private Duration connectTimeout = Duration.ofSeconds(3);
+        private Duration requestTimeout = Duration.ofSeconds(10);
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        public String getCollection() { return collection; }
+        public void setCollection(String collection) { this.collection = collection; }
+        public String getEmbeddingModel() { return embeddingModel; }
+        public void setEmbeddingModel(String v) { this.embeddingModel = v; }
+        public int getEmbeddingDimension() { return embeddingDimension; }
+        public void setEmbeddingDimension(int v) { this.embeddingDimension = v; }
+        public String getEmbeddingBaseUrl() { return embeddingBaseUrl; }
+        public void setEmbeddingBaseUrl(String v) { this.embeddingBaseUrl = v; }
+        public String getEmbeddingApiKey() { return embeddingApiKey; }
+        public void setEmbeddingApiKey(String v) { this.embeddingApiKey = v; }
+        public long getEmbeddingInputMicroCentsPerToken() { return embeddingInputMicroCentsPerToken; }
+        public void setEmbeddingInputMicroCentsPerToken(long v) { this.embeddingInputMicroCentsPerToken = v; }
+        public String getVectorStoreUrl() { return vectorStoreUrl; }
+        public void setVectorStoreUrl(String v) { this.vectorStoreUrl = v; }
+        public String getVectorStoreApiKey() { return vectorStoreApiKey; }
+        public void setVectorStoreApiKey(String v) { this.vectorStoreApiKey = v; }
+        public boolean isFailOnMismatch() { return failOnMismatch; }
+        public void setFailOnMismatch(boolean v) { this.failOnMismatch = v; }
+        public Duration getConnectTimeout() { return connectTimeout; }
+        public void setConnectTimeout(Duration v) { this.connectTimeout = v; }
+        public Duration getRequestTimeout() { return requestTimeout; }
+        public void setRequestTimeout(Duration v) { this.requestTimeout = v; }
     }
 }

@@ -57,7 +57,7 @@ java -jar gateway-server/target/gateway-server-0.0.1-SNAPSHOT.jar
 | Redis | localhost:6380 | 跨節點成本帳本 |
 | 假 Provider | 9101 / 9102 / 9103 | 快 / 慢 / 不穩，三種個性 |
 | PostgreSQL | localhost:5433 | **應用目前未使用** |
-| Qdrant | http://localhost:6333 | **應用目前未使用**，僅 `rag-eval` 會碰 |
+| Qdrant | http://localhost:6333 | RAG 的向量庫（預設未啟用，見下）|
 
 連接埠都可用環境變數覆寫（`REDIS_PORT`、`GRAFANA_PORT` 等），
 預設值刻意避開常見佔用（6379／9090／3000）。
@@ -91,6 +91,43 @@ java -jar gateway-server/target/gateway-server-0.0.1-SNAPSHOT.jar
 
 ---
 
+## 檢索增強（RAG）
+
+用請求裡的擴充欄位啟用，而不是自動注入——呼叫端要知道答案依據了什麼：
+
+```json
+{
+  "model": "any",
+  "messages": [{"role": "user", "content": "token bucket rate limit"}],
+  "max_tokens": 200,
+  "x_rag": {"collection": "docs", "top_k": 3}
+}
+```
+
+回應的 `x_gateway.rag` 會帶回檢索到的來源、分數、嵌入成本，以及**有沒有降級**。
+
+先建索引再開啟：
+
+```bash
+node tools/rag-index.js --input docs/rag-sample-kb.jsonl --collection docs
+```
+
+三個刻意的取捨：
+
+**網關只讀，不寫。** 建索引是完全不同的生命週期（批次、慢、要決定分塊策略），
+放進網關會讓它變成資料管線，而且索引任務的失敗會影響線上請求。
+
+**嵌入不一致就拒絕啟動。** 用 A 模型建索引、用 B 模型查詢，向量庫照樣回傳最近鄰，
+只是全部不相關——系統不報錯，只會變笨。維度不同其實算幸運（查詢時會直接報錯）；
+**維度相同但模型不同才是災難**。Qdrant 原生不記錄索引是誰建的，
+所以契約是每個 point 的 payload 要帶 `_embedding_model`，由 `rag-index` 維護。
+
+**檢索失敗預設是失敗。** 靜默降級成「不帶 context 的普通問答」會回 200
+和一段通順但毫無依據的答案。要降級必須在 `x_rag.degrade_on_failure` 明確要求，
+而且回應會標記 `degraded: true`。
+
+---
+
 ## 幾個非顯而易見的設計決定
 
 完整說明在 [CLAUDE.md](CLAUDE.md)，這裡只列最容易寫錯的：
@@ -110,6 +147,11 @@ java -jar gateway-server/target/gateway-server-0.0.1-SNAPSHOT.jar
 **成本上限預扣而非事後記帳。** 事後記帳擋不住併發——一百個請求同時通過檢查、
 同時發現額度還夠，然後一起超支。
 
+**檢索必須在成本預扣之前。** 預扣用 `estimatedPromptTokens()` 估算，
+而檢索會往 prompt 塞進成千個 token。順序反了的話那些 token 完全沒被算進去，
+成本上限會系統性低估，而且低估的比例正好隨檢索量成長。
+實測：同一個問題，不檢索花 1800 微美分，帶檢索花 5950 微美分。
+
 **金額一律用整數微美分。** LLM 的單次成本常常小到 0.0001 美分，
 浮點數累加數百萬筆會產生可觀誤差，而這是要拿去對帳的數字。
 
@@ -127,7 +169,7 @@ java -jar gateway-server/target/gateway-server-0.0.1-SNAPSHOT.jar
 | `stream-check` | SSE 的緩衝、取消、token 完整性、中斷表達（19 項）|
 | `cost-guard` | 金鑰／`max_tokens`／對沖策略靜態掃描 + 成本倍率量測 |
 | `bench` | TTFT 分位數與虛擬／平台執行緒對照，含基準線歸因 |
-| `rag-eval` | 嵌入一致性契約與 recall@k |
+| `rag-eval` | 嵌入一致性檢查與 recall@k |
 | `release-check` | 串成一次交付把關，可接進 CI |
 
 兩個 hook，嚴格程度刻意不同：
@@ -188,9 +230,6 @@ node .claude/skills/bench/bench.js --concurrency 100 --rounds 3 --upstream-ttft 
 
 - **沒有任何 JUnit 測試。** 驗證全部是端到端的 Node 腳本（`release-check` 串起來）。
   單元測試該補，但這類系統的缺陷幾乎都出在跨元件的互動上，端到端先做是刻意的取捨。
-- **沒有 RAG。** Qdrant 在 `dev-stack` 裡跑著，但應用沒有接。
-  `rag-eval` 已定義好「collection 必須記錄自己是用哪個嵌入模型建的」這個契約，
-  等實作進來就能用。
 - **沒有語意快取、沒有工作流編排。**
 - **沒有後台管理頁面。** 觀測用 Grafana，改設定目前要重啟。
   執行期設定的管理 API 是下一步，UI 要等多租戶隔離層級定案。

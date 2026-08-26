@@ -43,6 +43,19 @@ gateway:
     daily-limit-usd: 50
     per-tenant-daily-limit-usd: 10
 
+  rag:
+    # 預設關閉：沒有索引的 RAG 只會讓每個請求多付一次嵌入費用然後檢索到空結果。
+    # 開之前先建索引：node tools/rag-index.js --input docs/rag-sample-kb.jsonl
+    enabled: ${RAG_ENABLED:false}
+    collection: ${RAG_COLLECTION:docs}
+    # 索引與查詢必須是同一個模型。啟動時會拿這兩個值跟 collection 實際記錄的比對，
+    # 不符就拒絕啟動——維度相同但模型不同的話不會報錯，只是檢索結果全部不相關
+    embedding-model: ${RAG_EMBEDDING_MODEL:fake-embed-v1}
+    embedding-dimension: ${RAG_EMBEDDING_DIM:32}
+    embedding-base-url: ${RAG_EMBEDDING_URL:http://localhost:9101}
+    vector-store-url: ${RAG_VECTOR_STORE_URL:http://localhost:6333}
+    fail-on-mismatch: true
+
   providers:
     # 本機開發預設指向假 Provider（見 tools/fake-provider）。
     # 金鑰一律只從環境變數注入，設定檔不得出現任何金鑰字面值。

@@ -13,7 +13,7 @@
  *
  *   2. **不要讓「非阻擋」變成「可以忽略」。** 非阻擋項目一樣會列在報告最前面，
  *      只是不讓 CI 變紅。分成兩級是因為有些缺口是已知且有意接受的
- *      （例如目前還沒有 RAG 程式碼），不是因為它們不重要。
+ *      （例如壓測受當下機器負載影響），不是因為它們不重要。
  *
  * 用法：
  *   node .claude/skills/release-check/check.js
@@ -144,8 +144,9 @@ const STAGES = [
     },
     {
         name: 'RAG 檢索品質',
-        // 目前專案還沒有 RAG 程式碼，這一項會如實報告「沒有東西可檢查」。
-        // 列為非阻擋是因為那是已知且有意接受的狀態，不是因為它不重要
+        // 非阻擋是因為它依賴「索引已經建好」這個環境前置條件——
+        // 全新的機器上沒有索引是正常的，不該擋住發版。
+        // 真正的把關在「RAG 端到端」那一項，它會自己建索引再驗
         blocking: false,
         run: node('.claude/skills/rag-eval/check.js'),
     },
@@ -173,6 +174,12 @@ const STAGES = [
         blocking: true,
         needsGateway: true,
         run: node('tools/verify-dashboard.js'),
+    },
+    {
+        name: 'RAG 端到端',
+        // 自己管理網關（要用不同設定驗「該啟動失敗」的情境），所以不放進 needsGateway
+        blocking: true,
+        run: node('tools/verify-rag.js'),
     },
     {
         name: '路由與對沖',
