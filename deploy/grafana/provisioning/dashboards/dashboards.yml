@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: AI Gateway
+    type: file
+    # 允許在 Grafana UI 上調整後存回檔案，改好的版本要記得 commit 回來，
+    # 否則下次 compose 重建會被檔案版本覆蓋掉
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

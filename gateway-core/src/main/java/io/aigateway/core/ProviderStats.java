@@ -39,6 +39,16 @@ public final class ProviderStats {
     // 累計值只供指標輸出，不參與路由決策
     private final AtomicLong totalFailures = new AtomicLong();
     private final AtomicLong totalSuccesses = new AtomicLong();
+    /**
+     * 送出的上游請求數。
+     *
+     * <p>與 successes + failures 不同：被對沖中止的落敗者兩邊都不算，
+     * 但它**確實送出去了、確實花了錢**。成本倍率要用這個數字算，
+     * 用成功數算會低估——而低估的正是對沖多花的那一部分。
+     */
+    private final AtomicLong totalAttempts = new AtomicLong();
+    /** 被中止的次數（對沖落敗或客戶端斷線）。這是「省下來的錢」的直接證據 */
+    private final AtomicLong totalCancelled = new AtomicLong();
 
     /** 下一次半開探測的時間點。{@link #NOT_SCHEDULED} 表示目前沒有在降級狀態 */
     private static final long NOT_SCHEDULED = Long.MIN_VALUE;
@@ -146,11 +156,33 @@ public final class ProviderStats {
         return sampleCount.get();
     }
 
+    public void recordAttempt() {
+        totalAttempts.incrementAndGet();
+    }
+
+    public void recordCancelled() {
+        totalCancelled.incrementAndGet();
+    }
+
     public long totalSuccesses() {
         return totalSuccesses.get();
     }
 
     public long totalFailures() {
         return totalFailures.get();
+    }
+
+    public long totalAttempts() {
+        return totalAttempts.get();
+    }
+
+    public long totalCancelled() {
+        return totalCancelled.get();
+    }
+
+    /** 目前窗口內的 TTFT 分位數，供指標輸出。樣本不足時回傳 -1 而不是猜一個值 */
+    public long ttftMillis(double percentile) {
+        Duration sentinel = Duration.ofMillis(-1);
+        return ttftPercentile(percentile, sentinel).toMillis();
     }
 }

@@ -52,6 +52,7 @@ public final class HedgingChatClient implements AutoCloseable {
     private final BudgetLedger budget;
     private final Duration probeInterval;
     private final double probeFailureThreshold;
+    private final GatewayCounters counters;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
     public HedgingChatClient(ProviderRegistry registry,
@@ -60,7 +61,8 @@ public final class HedgingChatClient implements AutoCloseable {
                              Duration attemptTimeout,
                              BudgetLedger budget,
                              Duration probeInterval,
-                             double probeFailureThreshold) {
+                             double probeFailureThreshold,
+                             GatewayCounters counters) {
         this.registry = registry;
         this.routing = routing;
         this.hedgePolicy = hedgePolicy;
@@ -68,6 +70,7 @@ public final class HedgingChatClient implements AutoCloseable {
         this.budget = budget;
         this.probeInterval = probeInterval;
         this.probeFailureThreshold = probeFailureThreshold;
+        this.counters = counters;
     }
 
     /**
@@ -79,6 +82,8 @@ public final class HedgingChatClient implements AutoCloseable {
      * @throws ProviderException 所有候選都失敗、錯誤本身不值得重試，或已達每日成本上限
      */
     public ChatStream stream(ChatRequest request) {
+        // 一次客戶端呼叫記一次。complete() 內部也走這裡，所以兩條路徑都算得到
+        counters.recordRequest();
         Candidates candidates = orderedCandidates(request);
 
         // 用最貴的候選估算：對沖或失敗切換可能落到任何一家，低估會讓上限形同虛設
@@ -130,6 +135,7 @@ public final class HedgingChatClient implements AutoCloseable {
                     if (!haveSpare) throw noCandidateSucceeded(request, failures);
                     LlmProvider next = candidates.get(nextCandidate++);
                     log.debug("已啟動的候選全部失敗，切換至 {}", next.name());
+                    counters.recordFailover();
                     running.add(launch(next, request, finished, settled));
                     continue;
                 }
@@ -148,6 +154,7 @@ public final class HedgingChatClient implements AutoCloseable {
                     LlmProvider hedge = candidates.get(nextCandidate++);
                     log.debug("主要 Provider 超過 {} 未回應，補發對沖至 {}", hedgeDelay.get(), hedge.name());
                     hedgesLaunched++;
+                    counters.recordHedge();
                     running.add(launch(hedge, request, finished, settled));
                     continue;
                 }
@@ -217,6 +224,7 @@ public final class HedgingChatClient implements AutoCloseable {
                 LlmProvider candidate = ordered.get(index);
                 ProviderStats stats = registry.statsFor(candidate.name());
                 if (stats.tryClaimProbe(probeInterval, probeFailureThreshold)) {
+                    counters.recordProbe();
                     log.info("半開探測：{}（失敗率 {}）暫時提到第一位，失敗時由失敗切換兜住",
                             candidate.name(), String.format("%.0f%%", stats.failureRate() * 100));
                     ordered.remove(index);
@@ -251,6 +259,8 @@ public final class HedgingChatClient implements AutoCloseable {
                          AtomicBoolean settled) {
         long startedAt = System.nanoTime();
         ChatStream stream = null;
+        // 送出就算一次嘗試，不管後來成功、失敗還是被中止——成本倍率要算的是「送出幾次」
+        registry.statsFor(provider.name()).recordAttempt();
         try {
             stream = provider.stream(request);
             if (!stream.hasNext()) {
@@ -264,6 +274,7 @@ public final class HedgingChatClient implements AutoCloseable {
             if (settled.get()) {
                 // 已經有人勝出，這條是輸家：立刻中止上游，不要繼續產生 token
                 stream.close();
+                registry.statsFor(provider.name()).recordCancelled();
                 return;
             }
             finished.offer(new Attempt(provider.name(), ChatStream.withPrefetched(first, stream), null));
@@ -275,6 +286,7 @@ public final class HedgingChatClient implements AutoCloseable {
                 // 之後更不容易被排為主要 Provider；而越少被選中就越少機會刷新統計——
                 // 一次對沖落敗會變成永久降級。落敗只代表「這次比較慢」，不代表「壞掉」。
                 log.debug("{} 在對沖中落敗並已中止", provider.name());
+                registry.statsFor(provider.name()).recordCancelled();
                 return;
             }
             registry.statsFor(provider.name()).recordFailure();

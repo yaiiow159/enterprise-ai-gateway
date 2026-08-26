@@ -4,14 +4,18 @@ import java.time.Clock;
 import java.time.Duration;
 
 import io.aigateway.core.BudgetLedger;
+import io.aigateway.core.GatewayCounters;
 import io.aigateway.core.HedgePolicy;
 import io.aigateway.core.HedgingChatClient;
 import io.aigateway.core.InMemoryBudgetLedger;
+import io.aigateway.core.LlmProvider;
 import io.aigateway.core.ModelCapability;
 import io.aigateway.core.ProviderRegistry;
+import io.aigateway.core.ProviderStats;
 import io.aigateway.core.RedisBudgetLedger;
 import io.aigateway.core.RoutingStrategy;
 import io.aigateway.providers.OpenAiCompatibleProvider;
+import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.binder.MeterBinder;
 import org.slf4j.Logger;
@@ -138,16 +142,75 @@ public class GatewayConfiguration {
         };
     }
 
+    @Bean
+    GatewayCounters gatewayCounters() {
+        return new GatewayCounters();
+    }
+
+    /**
+     * 把路由層的狀態輸出成指標。
+     *
+     * <p>這些數字原本只活在 {@link ProviderStats} 的記憶體裡，從外面完全看不到——
+     * 於是「哪一家在拖慢整體」「對沖多花了多少」「某家是不是正在惡化」
+     * 這些問題只能靠讀日誌拼湊。儀表板要有意義，資料得先出得來。
+     *
+     * <p>TTFT 分位數在樣本不足時回報 <b>-1</b> 而不是回退值：儀表板上
+     * 「還沒有足夠樣本」和「量到 500ms」是完全不同的兩件事，
+     * 混在一起會讓人對著一個假數字做決定。
+     */
+    @Bean
+    MeterBinder providerMetrics(ProviderRegistry registry, GatewayCounters counters) {
+        return meterRegistry -> {
+            for (LlmProvider provider : registry.all()) {
+                String name = provider.name();
+                ProviderStats stats = registry.statsFor(name);
+
+                Gauge.builder("gateway.provider.ttft.p50.milliseconds", stats, s -> s.ttftMillis(0.5))
+                        .tag("provider", name).description("TTFT 中位數；-1 表示樣本不足").register(meterRegistry);
+                Gauge.builder("gateway.provider.ttft.p95.milliseconds", stats, s -> s.ttftMillis(0.95))
+                        .tag("provider", name).description("TTFT p95；-1 表示樣本不足").register(meterRegistry);
+                Gauge.builder("gateway.provider.failure.rate", stats, ProviderStats::failureRate)
+                        .tag("provider", name).description("最近一個窗口內的失敗比例").register(meterRegistry);
+
+                // 累加值用 FunctionCounter 而不是 Gauge：型別要誠實。
+                // 註冊成 Gauge 的話 Prometheus 不知道它只增不減，`rate()` 的重啟處理
+                // 就會失效——儀表板上會在每次重新部署後出現一根假的尖峰。
+                //
+                // 用 FunctionCounter 包住既有的累加值，也避免另外維護第二份計數：
+                // 兩份計數遲早會對不起來，而對不起來的計數比沒有計數更難查。
+                FunctionCounter.builder("gateway.provider.attempts", stats, ProviderStats::totalAttempts)
+                        .tag("provider", name).description("送出的上游請求數（含被中止的）").register(meterRegistry);
+                FunctionCounter.builder("gateway.provider.successes", stats, ProviderStats::totalSuccesses)
+                        .tag("provider", name).register(meterRegistry);
+                FunctionCounter.builder("gateway.provider.failures", stats, ProviderStats::totalFailures)
+                        .tag("provider", name).register(meterRegistry);
+                FunctionCounter.builder("gateway.provider.cancelled", stats, ProviderStats::totalCancelled)
+                        .tag("provider", name).description("被中止的次數（對沖落敗或客戶端斷線）").register(meterRegistry);
+            }
+
+            FunctionCounter.builder("gateway.requests", counters, GatewayCounters::requests)
+                    .description("客戶端請求數，成本倍率的分母").register(meterRegistry);
+            FunctionCounter.builder("gateway.hedges.launched", counters, GatewayCounters::hedgesLaunched)
+                    .description("補發對沖的次數").register(meterRegistry);
+            FunctionCounter.builder("gateway.failovers", counters, GatewayCounters::failovers)
+                    .description("失敗切換的次數").register(meterRegistry);
+            FunctionCounter.builder("gateway.probes", counters, GatewayCounters::probes)
+                    .description("半開探測的次數").register(meterRegistry);
+        };
+    }
+
     @Bean(destroyMethod = "close")
     HedgingChatClient hedgingChatClient(ProviderRegistry registry,
                                         RoutingStrategy routing,
                                         HedgePolicy hedgePolicy,
                                         BudgetLedger budgetLedger,
+                                        GatewayCounters counters,
                                         GatewayProperties properties) {
         return new HedgingChatClient(registry, routing, hedgePolicy,
                 properties.getAttemptTimeout(), budgetLedger,
                 properties.getRouting().getProbeInterval(),
-                properties.getRouting().getProbeFailureThreshold());
+                properties.getRouting().getProbeFailureThreshold(),
+                counters);
     }
 
     /** 讓設定裡的逾時可以寫成 3s／60s 這種可讀格式 */

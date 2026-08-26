@@ -167,6 +167,14 @@ const STAGES = [
         run: node('.claude/skills/stream-check/check.js'),
     },
     {
+        name: '儀表板面板有資料',
+        // 排在成本與串流之後：那兩項會產生流量，面板才有東西可查。
+        // 只有「查詢寫壞了」才會讓它失敗；「這種流量還沒發生」只是警告
+        blocking: true,
+        needsGateway: true,
+        run: node('tools/verify-dashboard.js'),
+    },
+    {
         name: '路由與對沖',
         blocking: true,
         run: node('tools/verify-routing.js'),

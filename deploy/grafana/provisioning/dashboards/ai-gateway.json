@@ -1,0 +1,266 @@
+{
+  "uid": "ai-gateway-overview",
+  "title": "AI Gateway 總覽",
+  "description": "圍繞這個系統特有的問題設計：錢花到哪、哪一家在拖慢、對沖多花了多少。JVM 與 HTTP 的通用指標刻意不放在這裡——那些用 Grafana 官方的 JVM 儀表板就好。",
+  "tags": ["ai-gateway"],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "provider",
+        "label": "Provider",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(gateway_provider_attempts_total, provider)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "錢",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "type": "gauge",
+      "title": "今日預算使用率",
+      "description": "撞到上限那一刻服務就開始回 429。這個面板存在的意義是在撞牆之前就看得到——沒有它，成本上限只是一次突然的故障。上限為 0（未設限）時顯示 0。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * gateway_budget_spent_microcents / clamp_min(gateway_budget_limit_microcents, 1)",
+          "legendFormat": "已用"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 70 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "今日支出",
+      "description": "內部一律用整數微美分記帳（浮點數累加數百萬筆會產生可觀誤差），這裡換算成美元只是為了給人看。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 5, "x": 6, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "gateway_budget_spent_microcents / 100 / 1000000",
+          "legendFormat": "已用"
+        },
+        {
+          "refId": "B",
+          "expr": "gateway_budget_limit_microcents / 100 / 1000000",
+          "legendFormat": "上限"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "decimals": 4 }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "成本倍率（一次客戶端請求 → 幾次上游請求）",
+      "description": "這是整張儀表板最重要的數字：它直接就是帳單的乘數。1.0 表示沒有浪費，3.0 表示帳單是三倍。對沖、失敗切換、重試全都會推高它。延遲對沖下應該貼近 1.0；持續高於 1.2 就要去看下面的『對沖與失敗切換』面板找原因。\n\n注意分母也要包 sum()：PromQL 的二元運算會比對標籤，sum() 會丟掉標籤而裸的 rate() 保留 application 標籤，兩邊對不上時「回傳空集合而不是報錯」——面板看起來就只是「沒有資料」，與「還沒有流量」完全分不出來。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 13, "x": 11, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(gateway_provider_attempts_total[5m])) / clamp_min(sum(rate(gateway_requests_total[5m])), 0.0001)",
+          "legendFormat": "成本倍率"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2,
+          "min": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1.2 },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Provider 健康度",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 8 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "TTFT p95（依 Provider）",
+      "description": "量的是首個 token 抵達的時間，不是整段完成時間——串流情境下使用者感受到的是首字延遲，而對沖的勝負也在第一個 token 前就分出來了。\n\n值為 -1 代表『樣本不足（少於 8 筆）』而不是『很快』。剛啟動或剛恢復的 Provider 會是這個狀態。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "gateway_provider_ttft_p95_milliseconds{provider=~\"$provider\"} > 0",
+          "legendFormat": "{{provider}} p95"
+        },
+        {
+          "refId": "B",
+          "expr": "gateway_provider_ttft_p50_milliseconds{provider=~\"$provider\"} > 0",
+          "legendFormat": "{{provider}} p50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "失敗率（依 Provider）",
+      "description": "最近 128 次嘗試的失敗比例，與 TTFT 用同一個滾動窗口。刻意不用累計值——累計值不會衰減，一小時前的故障會永遠留在分母裡，讓已經恢復的 Provider 再也回不到原本的排序位置。\n\n超過 50%（下方紅線）會觸發半開探測。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "gateway_provider_failure_rate{provider=~\"$provider\"}",
+          "legendFormat": "{{provider}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.5 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "上游請求分布（依 Provider）",
+      "description": "誰在實際承接流量。某一家掉到 0 而其他家沒有對應上升，通常代表它被降級了——對照右邊的『半開探測』面板可以確認它有沒有在被試。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 17 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(gateway_provider_attempts_total{provider=~\"$provider\"}[5m])",
+          "legendFormat": "{{provider}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 20, "stacking": { "mode": "normal" } }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "被中止的上游請求（依 Provider）",
+      "description": "對沖落敗或客戶端斷線時中止的次數——這是「省下來的錢」的直接證據。\n\n如果這個數字長期為 0 而對沖卻一直在觸發，代表落敗者沒有被真的中止：使用者早就離開了，我們還在為那些沒人看的 token 付錢，而且不會有任何錯誤徵兆。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 17 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(gateway_provider_cancelled_total{provider=~\"$provider\"}[5m])",
+          "legendFormat": "{{provider}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "路由決策",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "對沖、失敗切換與半開探測",
+      "description": "三個事件回答的是「為什麼」這次呼叫花了這麼多錢或這麼久：\n\n• 對沖 — 多打一家換延遲，是可選的花費。它的觸發率乘上單次成本就是對沖這個機制的帳單。\n• 失敗切換 — 上游出問題的直接證據。它上升代表某家正在惡化，而使用者已經在承受多一次往返。\n• 半開探測 — 降級中的 Provider 正在被試。持續不為零代表某家一直沒好；歸零代表它恢復了。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 25 },
+      "targets": [
+        { "refId": "A", "expr": "rate(gateway_hedges_launched_total[5m])", "legendFormat": "對沖" },
+        { "refId": "B", "expr": "rate(gateway_failovers_total[5m])", "legendFormat": "失敗切換" },
+        { "refId": "C", "expr": "rate(gateway_probes_total[5m])", "legendFormat": "半開探測" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "客戶端看到的結果",
+      "description": "429 同時代表「上游限流」與「已達每日成本上限」——兩者對客戶端的處理方式相同，差別在回應的 type 欄位（rate_limited / budget_exceeded）。要分辨是哪一種，看上面的預算使用率面板。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 25 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (status) (rate(http_server_requests_seconds_count{uri=\"/v1/chat/completions\"}[5m]))",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "decimals": 2 }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value_and_name",
+        "colorMode": "value"
+      }
+    }
+  ]
+}
