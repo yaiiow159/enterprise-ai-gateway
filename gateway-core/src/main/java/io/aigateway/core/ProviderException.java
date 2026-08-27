@@ -35,6 +35,26 @@ public class ProviderException extends RuntimeException {
         return kind.retryable;
     }
 
+    /**
+     * HTTP 狀態碼 → 錯誤分類。
+     *
+     * <p>放在這裡而不是各個 Provider 各寫一份：這條映射決定的是「值不值得換一家再試」，
+     * 是整個系統的共同語意。散在多處的後果不是抽象不夠漂亮，而是**行為會分岔**——
+     * 重構前 chat 與 embedding 兩支對「未列舉的 4xx」的判斷剛好相反
+     * （一邊 BAD_REQUEST 不重試、一邊 SERVER_ERROR 會重試），
+     * 而兩邊各自看起來都正確，沒有任何測試會失敗。
+     *
+     * <p>統一採用「4xx 一律不重試」：請求本身有問題時，換誰都是一樣的結果，
+     * 重試只是多等一次、多付一次錢。
+     */
+    public static Kind kindForHttpStatus(int status) {
+        return switch (status) {
+            case 401, 403 -> Kind.AUTHENTICATION;
+            case 429 -> Kind.RATE_LIMITED;
+            default -> status >= 500 ? Kind.SERVER_ERROR : Kind.BAD_REQUEST;
+        };
+    }
+
     public enum Kind {
         RATE_LIMITED(true),
         SERVER_ERROR(true),

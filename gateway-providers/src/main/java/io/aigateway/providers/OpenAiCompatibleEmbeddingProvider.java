@@ -12,7 +12,6 @@ import java.util.List;
 import java.util.Map;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.aigateway.core.EmbeddingProvider;
 import io.aigateway.core.ProviderException;
 import io.aigateway.core.Usage;
@@ -24,8 +23,6 @@ import io.aigateway.core.Usage;
  * 但**成本歸戶的問題完全相同**：不能因為上游沒回 usage 就記成 0。
  */
 public class OpenAiCompatibleEmbeddingProvider implements EmbeddingProvider {
-
-    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final String name;
     private final URI endpoint;
@@ -90,39 +87,37 @@ public class OpenAiCompatibleEmbeddingProvider implements EmbeddingProvider {
         }
 
         if (response.statusCode() >= 400) {
-            throw new ProviderException(name, kindFor(response.statusCode()), response.statusCode(),
-                    "嵌入呼叫回傳 " + response.statusCode(), null);
+            throw new ProviderException(name, ProviderException.kindForHttpStatus(response.statusCode()),
+                    response.statusCode(), "嵌入呼叫回傳 " + response.statusCode(), null);
         }
 
-        try {
-            JsonNode root = MAPPER.readTree(response.body());
-            List<float[]> vectors = new ArrayList<>();
-            for (JsonNode item : root.path("data")) {
-                JsonNode values = item.path("embedding");
-                float[] vector = new float[values.size()];
-                for (int index = 0; index < values.size(); index++) vector[index] = (float) values.get(index).asDouble();
-                vectors.add(vector);
-            }
+        JsonNode root = ProviderJson.readTree(name, response.body(), "嵌入回應");
 
-            if (vectors.size() != inputs.size()) {
-                throw new ProviderException(name, ProviderException.Kind.SERVER_ERROR, 502,
-                        "回傳 %d 筆向量，但送出 %d 筆輸入".formatted(vectors.size(), inputs.size()), null);
+        List<float[]> vectors = new ArrayList<>();
+        for (JsonNode item : root.path("data")) {
+            JsonNode values = item.path("embedding");
+            float[] vector = new float[values.size()];
+            for (int index = 0; index < values.size(); index++) {
+                vector[index] = (float) values.get(index).asDouble();
             }
-            // 維度不符要當場擋下來，不要讓一個維度錯誤的向量流進檢索——
-            // 向量庫會直接報錯，但錯誤訊息會指向查詢而不是這裡
-            for (float[] vector : vectors) {
-                if (vector.length != dimension) {
-                    throw new ProviderException(name, ProviderException.Kind.SERVER_ERROR, 502,
-                            "上游回傳 %d 維，設定為 %d 維".formatted(vector.length, dimension), null);
-                }
-            }
+            vectors.add(vector);
+        }
 
-            lastUsage.set(parseUsage(root.path("usage"), inputs));
-            return vectors;
-        } catch (IOException error) {
+        if (vectors.size() != inputs.size()) {
             throw new ProviderException(name, ProviderException.Kind.SERVER_ERROR, 502,
-                    "嵌入回應不是合法的 JSON", error);
+                    "回傳 %d 筆向量，但送出 %d 筆輸入".formatted(vectors.size(), inputs.size()), null);
         }
+        // 維度不符要當場擋下來，不要讓一個維度錯誤的向量流進檢索——
+        // 向量庫會直接報錯，但錯誤訊息會指向查詢而不是這裡
+        for (float[] vector : vectors) {
+            if (vector.length != dimension) {
+                throw new ProviderException(name, ProviderException.Kind.SERVER_ERROR, 502,
+                        "上游回傳 %d 維，設定為 %d 維".formatted(vector.length, dimension), null);
+            }
+        }
+
+        lastUsage.set(parseUsage(root.path("usage"), inputs));
+        return vectors;
     }
 
     @Override
@@ -149,26 +144,10 @@ public class OpenAiCompatibleEmbeddingProvider implements EmbeddingProvider {
         HttpRequest.Builder builder = HttpRequest.newBuilder(endpoint)
                 .timeout(requestTimeout)
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(writeJson(payload), StandardCharsets.UTF_8));
+                .POST(HttpRequest.BodyPublishers.ofString(ProviderJson.write(name, payload), StandardCharsets.UTF_8));
         // 金鑰只從設定注入，永遠不進日誌或錯誤訊息
         if (apiKey != null && !apiKey.isBlank()) builder.header("Authorization", "Bearer " + apiKey);
         return builder.build();
     }
 
-    private String writeJson(Object value) {
-        try {
-            return MAPPER.writeValueAsString(value);
-        } catch (IOException error) {
-            throw new ProviderException(name, ProviderException.Kind.BAD_REQUEST, 400, "無法序列化嵌入請求", error);
-        }
-    }
-
-    private static ProviderException.Kind kindFor(int status) {
-        return switch (status) {
-            case 401, 403 -> ProviderException.Kind.AUTHENTICATION;
-            case 429 -> ProviderException.Kind.RATE_LIMITED;
-            case 400, 404, 422 -> ProviderException.Kind.BAD_REQUEST;
-            default -> ProviderException.Kind.SERVER_ERROR;
-        };
-    }
 }

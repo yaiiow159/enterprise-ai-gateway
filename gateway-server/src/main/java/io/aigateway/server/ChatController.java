@@ -1,22 +1,18 @@
 package io.aigateway.server;
 
 import java.io.IOException;
-import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.aigateway.core.ChatChunk;
 import io.aigateway.core.ChatRequest;
-import io.aigateway.core.ChatResponse;
 import io.aigateway.core.ChatStream;
 import io.aigateway.core.HedgingChatClient;
 import io.aigateway.core.Message;
 import io.aigateway.core.ProviderException;
 import io.aigateway.core.RagAugmenter;
 import io.aigateway.core.RagOptions;
-import io.aigateway.core.RetrievedDocument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -65,7 +61,7 @@ public class ChatController {
     @PostMapping(path = "/v1/chat/completions", produces = MediaType.APPLICATION_JSON_VALUE)
     public Object chatCompletions(@RequestBody Map<String, Object> body,
                                   @RequestHeader(value = "X-Tenant", required = false) String tenant) {
-        ChatRequest request = toChatRequest(body, tenant);
+        ChatRequest request = OpenAiPayloads.toChatRequest(body, tenant);
 
         // 檢索**必須在這裡**，也就是在 client 的成本預扣之前。
         // 預扣用 estimatedPromptTokens() 估算，而檢索會往 prompt 塞進成千個 token；
@@ -76,7 +72,7 @@ public class ChatController {
 
         return effective.stream()
                 ? streamResponse(effective, retrieval)
-                : ResponseEntity.ok(toOpenAiResponse(client.complete(effective), retrieval));
+                : ResponseEntity.ok(OpenAiPayloads.toResponse(client.complete(effective), retrieval));
     }
 
     private RagAugmenter.RagResult retrieve(Map<String, Object> body, ChatRequest request, String tenant) {
@@ -140,7 +136,7 @@ public class ChatController {
                 while (upstream.hasNext()) {
                     ChatChunk chunk = upstream.next();
                     emitter.send(SseEmitter.event()
-                            .data(toOpenAiChunk(chunk, request, first ? retrieval : null),
+                            .data(json(OpenAiPayloads.toChunk(chunk, request, first ? retrieval : null)),
                                     MediaType.APPLICATION_JSON));
                     first = false;
                 }
@@ -163,135 +159,28 @@ public class ChatController {
 
     private void sendErrorEvent(SseEmitter emitter, ProviderException error) {
         try {
-            emitter.send(SseEmitter.event().data(MAPPER.writeValueAsString(Map.of(
-                    "error", Map.of(
-                            "message", error.getMessage(),
-                            "type", error.kind().name().toLowerCase(),
-                            "provider", error.providerName()))), MediaType.APPLICATION_JSON));
+            emitter.send(SseEmitter.event().data(json(OpenAiPayloads.toErrorEvent(
+                    error.getMessage(), error.kind().name().toLowerCase(), error.providerName())),
+                    MediaType.APPLICATION_JSON));
             emitter.complete();
         } catch (IOException ignored) {
             emitter.completeWithError(error);
         }
     }
 
-    /**
-     * 回報這次回答依據了什麼。
-     *
-     * <p>三件事都要出去，因為它們對應三種不同的狀況：
-     * <ul>
-     *   <li><b>來源與分數</b>——分數普遍偏低代表「檢索到了但都不相關」，
-     *       那與「沒檢索到」是不同的問題，只看有沒有結果會把兩者混為一談。</li>
-     *   <li><b>degraded</b>——檢索失敗但依設定繼續，**這個答案沒有依據**。
-     *       不講的話呼叫端會把它當成有根據的回答，那是最糟的情況。</li>
-     *   <li><b>note</b>——沒有命中的原因。</li>
-     * </ul>
-     */
-    private Map<String, Object> ragSummary(RagAugmenter.RagResult retrieval) {
-        Map<String, Object> summary = new LinkedHashMap<>();
-        summary.put("degraded", retrieval.degraded());
-        summary.put("documents", retrieval.documents().stream()
-                .map(document -> Map.<String, Object>of(
-                        "id", document.id(),
-                        "score", document.score()))
-                .toList());
-        summary.put("embedding_cost_micro_cents", retrieval.embeddingUsage().costMicroCents());
-        if (retrieval.note() != null) summary.put("note", retrieval.note());
-        return summary;
+    /** SSE 的 data 欄位要是字串，序列化只在這一處發生 */
+    private String json(Map<String, Object> payload) {
+        try {
+            return MAPPER.writeValueAsString(payload);
+        } catch (IOException error) {
+            throw new IllegalStateException("無法序列化回應內容", error);
+        }
     }
 
     private void closeQuietly(ChatStream stream, AtomicBoolean closed) {
         if (stream != null && closed.compareAndSet(false, true)) {
             stream.close();
         }
-    }
-
-    @SuppressWarnings("unchecked")
-    private ChatRequest toChatRequest(Map<String, Object> body, String tenant) {
-        List<Map<String, Object>> rawMessages = (List<Map<String, Object>>) body.get("messages");
-        if (rawMessages == null || rawMessages.isEmpty()) {
-            throw new IllegalArgumentException("messages 不可為空");
-        }
-
-        List<Message> messages = rawMessages.stream()
-                .map(raw -> new Message(
-                        Message.Role.valueOf(String.valueOf(raw.getOrDefault("role", "user")).toUpperCase()),
-                        String.valueOf(raw.getOrDefault("content", ""))))
-                .toList();
-
-        Object maxTokens = body.get("max_tokens");
-        return new ChatRequest(
-                String.valueOf(body.getOrDefault("model", "default")),
-                messages,
-                maxTokens == null ? null : ((Number) maxTokens).intValue(),
-                Boolean.TRUE.equals(body.get("stream")),
-                body.get("temperature") == null ? null : ((Number) body.get("temperature")).doubleValue(),
-                tenant,
-                Map.of());
-    }
-
-    private Map<String, Object> toOpenAiResponse(ChatResponse response, RagAugmenter.RagResult retrieval) {
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("id", response.id());
-        payload.put("object", "chat.completion");
-        payload.put("created", System.currentTimeMillis() / 1000);
-        payload.put("model", response.model());
-        payload.put("choices", List.of(Map.of(
-                "index", 0,
-                "message", Map.of("role", "assistant", "content", response.content()),
-                "finish_reason", finishReason(response.finishReason()))));
-        payload.put("usage", Map.of(
-                "prompt_tokens", response.usage().promptTokens(),
-                "completion_tokens", response.usage().completionTokens(),
-                "total_tokens", response.usage().totalTokens()));
-        Map<String, Object> gateway = new LinkedHashMap<>();
-        gateway.put("provider", response.providerName());
-        gateway.put("latency_ms", response.latencyMs());
-        gateway.put("cost_micro_cents", response.usage().costMicroCents());
-        if (retrieval != null) gateway.put("rag", ragSummary(retrieval));
-        payload.put("x_gateway", gateway);
-        return payload;
-    }
-
-    private String toOpenAiChunk(ChatChunk chunk, ChatRequest request, RagAugmenter.RagResult retrieval) {
-        try {
-            Map<String, Object> delta = chunk.delta() == null || chunk.delta().isEmpty()
-                    ? Map.of()
-                    : Map.of("content", chunk.delta());
-
-            Map<String, Object> payload = new LinkedHashMap<>();
-            payload.put("object", "chat.completion.chunk");
-            payload.put("created", System.currentTimeMillis() / 1000);
-            payload.put("model", request.model());
-            payload.put("choices", List.of(new LinkedHashMap<>(Map.of(
-                    "index", 0,
-                    "delta", delta,
-                    "finish_reason", chunk.finishReason() == null ? "" : finishReason(chunk.finishReason())))));
-            Map<String, Object> gateway = new LinkedHashMap<>();
-            gateway.put("provider", chunk.providerName());
-            if (retrieval != null) gateway.put("rag", ragSummary(retrieval));
-            payload.put("x_gateway", gateway);
-            if (chunk.usage() != null) {
-                payload.put("usage", Map.of(
-                        "prompt_tokens", chunk.usage().promptTokens(),
-                        "completion_tokens", chunk.usage().completionTokens(),
-                        "total_tokens", chunk.usage().totalTokens()));
-            }
-            return MAPPER.writeValueAsString(payload);
-        } catch (IOException error) {
-            throw new IllegalStateException("無法序列化串流 chunk", error);
-        }
-    }
-
-    private String finishReason(ChatChunk.FinishReason reason) {
-        if (reason == null) return "";
-        return switch (reason) {
-            case STOP -> "stop";
-            case LENGTH -> "length";
-            case CONTENT_FILTER -> "content_filter";
-            case TOOL_CALLS -> "tool_calls";
-            case UPSTREAM_ABORTED -> "upstream_aborted";
-            case ERROR -> "error";
-        };
     }
 
     @ExceptionHandler(ProviderException.class)

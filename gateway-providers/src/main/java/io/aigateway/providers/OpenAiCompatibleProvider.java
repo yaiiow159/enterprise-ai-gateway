@@ -19,7 +19,6 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.aigateway.core.ChatChunk;
 import io.aigateway.core.ChatRequest;
 import io.aigateway.core.ChatResponse;
@@ -44,7 +43,6 @@ import org.slf4j.LoggerFactory;
 public class OpenAiCompatibleProvider implements LlmProvider {
 
     private static final Logger log = LoggerFactory.getLogger(OpenAiCompatibleProvider.class);
-    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final String name;
     private final URI endpoint;
@@ -98,21 +96,16 @@ public class OpenAiCompatibleProvider implements LlmProvider {
             throw toProviderException(response.statusCode(), response.body());
         }
 
-        try {
-            JsonNode root = MAPPER.readTree(response.body());
-            JsonNode choice = root.path("choices").path(0);
-            return new ChatResponse(
-                    root.path("id").asText(""),
-                    root.path("model").asText(model),
-                    name,
-                    choice.path("message").path("content").asText(""),
-                    finishReason(choice.path("finish_reason").asText(null)),
-                    parseUsage(root.path("usage"), capability, request.estimatedPromptTokens(), -1),
-                    Duration.ofNanos(System.nanoTime() - startedAt).toMillis());
-        } catch (IOException error) {
-            throw new ProviderException(name, ProviderException.Kind.SERVER_ERROR, response.statusCode(),
-                    "回應不是合法的 JSON", error);
-        }
+        JsonNode root = ProviderJson.readTree(name, response.body(), "回應");
+        JsonNode choice = root.path("choices").path(0);
+        return new ChatResponse(
+                root.path("id").asText(""),
+                root.path("model").asText(model),
+                name,
+                choice.path("message").path("content").asText(""),
+                finishReason(choice.path("finish_reason").asText(null)),
+                parseUsage(root.path("usage"), capability, request.estimatedPromptTokens(), -1),
+                Duration.ofNanos(System.nanoTime() - startedAt).toMillis());
     }
 
     @Override
@@ -150,21 +143,13 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         HttpRequest.Builder builder = HttpRequest.newBuilder(endpoint)
                 .timeout(requestTimeout)
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(writeJson(payload), StandardCharsets.UTF_8));
+                .POST(HttpRequest.BodyPublishers.ofString(ProviderJson.write(name, payload), StandardCharsets.UTF_8));
 
         // 金鑰只從設定注入，且永遠不進日誌或錯誤訊息
         if (apiKey != null && !apiKey.isBlank()) {
             builder.header("Authorization", "Bearer " + apiKey);
         }
         return builder.build();
-    }
-
-    private String writeJson(Object value) {
-        try {
-            return MAPPER.writeValueAsString(value);
-        } catch (IOException error) {
-            throw new ProviderException(name, ProviderException.Kind.BAD_REQUEST, 400, "無法序列化請求", error);
-        }
     }
 
     private ProviderException connectionFailure(Exception error) {
@@ -181,22 +166,18 @@ public class OpenAiCompatibleProvider implements LlmProvider {
      * 400 與 401 換誰都一樣，重試只是多付一次錢又多等一次。
      */
     private ProviderException toProviderException(int status, String body) {
-        ProviderException.Kind kind = switch (status) {
-            case 400, 404, 422 -> ProviderException.Kind.BAD_REQUEST;
-            case 401, 403 -> ProviderException.Kind.AUTHENTICATION;
-            case 429 -> ProviderException.Kind.RATE_LIMITED;
-            default -> status >= 500 ? ProviderException.Kind.SERVER_ERROR : ProviderException.Kind.BAD_REQUEST;
-        };
-        return new ProviderException(name, kind, status, extractErrorMessage(body), null);
+        return new ProviderException(name, ProviderException.kindForHttpStatus(status), status,
+                extractErrorMessage(body), null);
     }
 
     /** 只取上游錯誤訊息本身，避免把整包回應（可能含請求內容）帶進日誌 */
     private String extractErrorMessage(String body) {
-        try {
-            JsonNode message = MAPPER.readTree(body).path("error").path("message");
+        // 這裡刻意用 quietly：真正的錯誤是 HTTP 狀態碼，
+        // 不該被「錯誤回應剛好不是 JSON」這件事蓋掉
+        JsonNode parsed = ProviderJson.readTreeQuietly(body);
+        if (parsed != null) {
+            JsonNode message = parsed.path("error").path("message");
             if (!message.isMissingNode()) return message.asText();
-        } catch (IOException ignored) {
-            // 上游未必回 JSON，退回截斷後的原文
         }
         return body == null ? "" : body.substring(0, Math.min(200, body.length()));
     }
@@ -324,7 +305,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
                         return usageReported ? null : syntheticUsageChunk();
                     }
 
-                    JsonNode root = MAPPER.readTree(payload);
+                    JsonNode root = ProviderJson.readTree(providerName, payload, "串流 chunk");
                     JsonNode choice = root.path("choices").path(0);
                     String delta = choice.path("delta").path("content").asText("");
                     ChatChunk.FinishReason reason = finishReason(choice.path("finish_reason").asText(null));
@@ -363,7 +344,8 @@ public class OpenAiCompatibleProvider implements LlmProvider {
          */
         private ChatChunk syntheticUsageChunk() {
             usageReported = true;
-            Usage estimated = parseUsage(MAPPER.createObjectNode(), capability, promptEstimate, contentChunks);
+            Usage estimated = parseUsage(ProviderJson.mapper().createObjectNode(),
+                    capability, promptEstimate, contentChunks);
             log.debug("{} 未回報用量，以本地估算補上：輸入 {}、輸出 {} token",
                     providerName, estimated.promptTokens(), estimated.completionTokens());
             return new ChatChunk("", null, estimated, providerName);

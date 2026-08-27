@@ -31,7 +31,7 @@ import org.slf4j.LoggerFactory;
  * 變成全站中斷。退回本地帳本至少還有「節點數 × 設定值」這個上界，
  * 並且會大聲記錄，讓人知道現在的保護是降級的。
  */
-public final class RedisBudgetLedger implements BudgetLedger {
+public final class RedisBudgetLedger extends AbstractBudgetLedger {
 
     private static final Logger log = LoggerFactory.getLogger(RedisBudgetLedger.class);
     private static final String SCRIPT_PATH = "/lua/budget_reserve.lua";
@@ -41,8 +41,6 @@ public final class RedisBudgetLedger implements BudgetLedger {
     private final RedisClient client;
     private final StatefulRedisConnection<String, String> connection;
     private final String script;
-    private final long dailyLimitMicroCents;
-    private final long perTenantLimitMicroCents;
     private final Clock clock;
     /** Redis 不可用時的退路。不是「放行」，而是降級成單節點保護 */
     private final BudgetLedger fallback;
@@ -53,11 +51,10 @@ public final class RedisBudgetLedger implements BudgetLedger {
                              long dailyLimitMicroCents,
                              long perTenantLimitMicroCents,
                              Clock clock) {
+        super(dailyLimitMicroCents, perTenantLimitMicroCents);
         this.client = RedisClient.create(redisUri);
         this.connection = client.connect();
         this.script = loadScript();
-        this.dailyLimitMicroCents = dailyLimitMicroCents;
-        this.perTenantLimitMicroCents = perTenantLimitMicroCents;
         this.clock = clock;
         this.fallback = new InMemoryBudgetLedger(dailyLimitMicroCents, perTenantLimitMicroCents, clock);
         this.scriptSha = connection.sync().scriptLoad(script);
@@ -92,13 +89,11 @@ public final class RedisBudgetLedger implements BudgetLedger {
         if (result.get(0) == 1L) return new Reservation(key, amount);
 
         boolean tenantScope = result.get(3) == 1L;
-        long alreadySpent = tenantScope ? result.get(2) : result.get(1);
-        long limit = tenantScope ? perTenantLimitMicroCents : dailyLimitMicroCents;
-        throw new ProviderException("budget", ProviderException.Kind.BUDGET_EXCEEDED, 429,
-                "%s的每日成本上限已達到：已用 %s / 上限 %s，本次請求估算 %s".formatted(
-                        tenantScope ? "租戶 " + key : "全域",
-                        usd(alreadySpent), usd(limit), usd(amount)),
-                null);
+        throw exceeded(
+                tenantScope ? "租戶 " + key : "全域",
+                tenantScope ? result.get(2) : result.get(1),
+                tenantScope ? perTenantLimitMicroCents() : dailyLimitMicroCents(),
+                amount);
     }
 
     @SuppressWarnings("unchecked")
@@ -107,8 +102,8 @@ public final class RedisBudgetLedger implements BudgetLedger {
         String[] keys = { globalKey(), tenantKey(key) };
         String[] args = {
                 String.valueOf(amount),
-                String.valueOf(dailyLimitMicroCents),
-                String.valueOf(perTenantLimitMicroCents),
+                String.valueOf(dailyLimitMicroCents()),
+                String.valueOf(perTenantLimitMicroCents()),
                 String.valueOf(KEY_TTL_SECONDS),
         };
         try {
@@ -124,16 +119,11 @@ public final class RedisBudgetLedger implements BudgetLedger {
     }
 
     @Override
-    public void settle(Reservation reservation, long actualMicroCents) {
-        if (reservation == null || reservation.amountMicroCents() == 0) return;
-
-        long delta = Math.max(0, actualMicroCents) - reservation.amountMicroCents();
-        if (delta == 0) return;
-
+    protected void applyDelta(String tenant, long delta) {
         try {
             RedisCommands<String, String> commands = connection.sync();
             commands.incrby(globalKey(), delta);
-            commands.incrby(tenantKey(reservation.tenant()), delta);
+            commands.incrby(tenantKey(tenant), delta);
         } catch (RuntimeException error) {
             // 結算失敗只會讓帳偏高（預扣沒退回），方向是保守的。
             // 記下來但不要拋——這時候請求已經服務完了，拋例外只是把成功變成失敗
@@ -149,11 +139,6 @@ public final class RedisBudgetLedger implements BudgetLedger {
         } catch (RuntimeException error) {
             return fallback.spentMicroCents(tenant);
         }
-    }
-
-    @Override
-    public long dailyLimitMicroCents() {
-        return dailyLimitMicroCents;
     }
 
     /**
@@ -173,16 +158,6 @@ public final class RedisBudgetLedger implements BudgetLedger {
         return daySlot() + ":tenant:" + tenant;
     }
 
-    private static String keyFor(String tenant) {
-        return tenant == null || tenant.isBlank() ? "(未指定租戶)" : tenant;
-    }
-
-    private static String usd(long microCents) {
-        double dollars = microCents / 100.0 / 1_000_000.0;
-        return dollars >= 0.01 || microCents == 0
-                ? "$%.2f".formatted(dollars)
-                : "%d 微美分".formatted(microCents);
-    }
 
     public void close() {
         connection.close();

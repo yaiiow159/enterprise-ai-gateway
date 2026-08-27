@@ -3,14 +3,8 @@ package io.aigateway.core;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -111,66 +105,8 @@ public final class HedgingChatClient implements AutoCloseable {
     }
 
     private ChatStream dispatch(ChatRequest request, List<LlmProvider> candidates) {
-        ProviderStats primaryStats = registry.statsFor(candidates.get(0).name());
-
-        AtomicBoolean settled = new AtomicBoolean();
-        // 容量要能裝下所有候選的結果，否則落敗者的 offer 會被丟棄而無法清理
-        BlockingQueue<Attempt> finished = new ArrayBlockingQueue<>(Math.max(1, candidates.size()));
-        List<Future<?>> running = new ArrayList<>();
-        List<ProviderException> failures = new ArrayList<>();
-
-        int nextCandidate = 0;
-        int hedgesLaunched = 0;
-        long deadline = System.nanoTime() + attemptTimeout.toNanos();
-
-        try {
-            running.add(launch(candidates.get(nextCandidate++), request, finished, settled));
-
-            while (true) {
-                boolean allLaunchedFailed = failures.size() == running.size();
-                boolean haveSpare = nextCandidate < candidates.size();
-
-                // 失敗切換：在飛的候選全掛了，立刻換下一家，不受對沖預算限制
-                if (allLaunchedFailed) {
-                    if (!haveSpare) throw noCandidateSucceeded(request, failures);
-                    LlmProvider next = candidates.get(nextCandidate++);
-                    log.debug("已啟動的候選全部失敗，切換至 {}", next.name());
-                    counters.recordFailover();
-                    running.add(launch(next, request, finished, settled));
-                    continue;
-                }
-
-                // 還有候選在飛：等它。等多久由對沖策略決定，但不超過整體逾時
-                Duration untilDeadline = Duration.ofNanos(Math.max(0, deadline - System.nanoTime()));
-                Optional<Duration> hedgeDelay = haveSpare
-                        ? hedgePolicy.delayBeforeNextAttempt(hedgesLaunched, primaryStats)
-                        : Optional.empty();
-                boolean hedging = hedgeDelay.isPresent() && hedgeDelay.get().compareTo(untilDeadline) < 0;
-                Attempt outcome = pollFor(finished, hedging ? hedgeDelay.get() : untilDeadline);
-
-                if (outcome == null) {
-                    if (!hedging) throw noCandidateSucceeded(request, failures);
-                    // 等到對沖點仍沒有人送出第一個 token，補發下一家
-                    LlmProvider hedge = candidates.get(nextCandidate++);
-                    log.debug("主要 Provider 超過 {} 未回應，補發對沖至 {}", hedgeDelay.get(), hedge.name());
-                    hedgesLaunched++;
-                    counters.recordHedge();
-                    running.add(launch(hedge, request, finished, settled));
-                    continue;
-                }
-
-                if (outcome.succeeded()) return claim(outcome, finished, running, settled);
-
-                failures.add(outcome.failure);
-                // 換一家也是一樣的結果（請求格式錯、金鑰錯、內容被拒），重試只是多付一次錢
-                if (!outcome.failure.retryable()) throw outcome.failure;
-            }
-        } catch (RuntimeException error) {
-            settled.set(true);
-            running.forEach(future -> future.cancel(true));
-            drainAndClose(finished);
-            throw error;
-        }
+        return new CandidateRace(request, candidates, registry, hedgePolicy, counters,
+                executor, attemptTimeout).run();
     }
 
     /** 非串流呼叫。內部沿用同一套對沖邏輯，讀完串流後組成完整回應 */
@@ -240,118 +176,8 @@ public final class HedgingChatClient implements AutoCloseable {
     private record Candidates(List<LlmProvider> ordered, String probedProvider) {
     }
 
-    private Future<?> launch(LlmProvider provider,
-                             ChatRequest request,
-                             BlockingQueue<Attempt> finished,
-                             AtomicBoolean settled) {
-        return executor.submit(() -> attempt(provider, request, finished, settled));
-    }
-
-    /**
-     * 單一候選：開串流、讀第一個 chunk、回報結果。
-     *
-     * <p>讀到第一個 chunk 才算成功——這是 TTFT 的定義，也是對沖的判準。
-     * 只是「連線建立」不算，那時候上游可能還在排隊。
-     */
-    private void attempt(LlmProvider provider,
-                         ChatRequest request,
-                         BlockingQueue<Attempt> finished,
-                         AtomicBoolean settled) {
-        long startedAt = System.nanoTime();
-        ChatStream stream = null;
-        // 送出就算一次嘗試，不管後來成功、失敗還是被中止——成本倍率要算的是「送出幾次」
-        registry.statsFor(provider.name()).recordAttempt();
-        try {
-            stream = provider.stream(request);
-            if (!stream.hasNext()) {
-                throw new ProviderException(provider.name(), ProviderException.Kind.STREAM_ABORTED, 502,
-                        "上游未送出任何內容就結束", null);
-            }
-            ChatChunk first = stream.next();
-            Duration ttft = Duration.ofNanos(System.nanoTime() - startedAt);
-            registry.statsFor(provider.name()).recordTtft(ttft);
-
-            if (settled.get()) {
-                // 已經有人勝出，這條是輸家：立刻中止上游，不要繼續產生 token
-                stream.close();
-                registry.statsFor(provider.name()).recordCancelled();
-                return;
-            }
-            finished.offer(new Attempt(provider.name(), ChatStream.withPrefetched(first, stream), null));
-        } catch (RuntimeException error) {
-            if (stream != null) stream.close();
-
-            if (settled.get()) {
-                // 這條是被勝出者中止的落敗者，不是真的失敗。記成失敗會讓它的 failureRate 上升，
-                // 之後更不容易被排為主要 Provider；而越少被選中就越少機會刷新統計——
-                // 一次對沖落敗會變成永久降級。落敗只代表「這次比較慢」，不代表「壞掉」。
-                log.debug("{} 在對沖中落敗並已中止", provider.name());
-                registry.statsFor(provider.name()).recordCancelled();
-                return;
-            }
-            registry.statsFor(provider.name()).recordFailure();
-            finished.offer(new Attempt(provider.name(), null, toProviderException(provider, error)));
-        }
-    }
-
-    private ChatStream claim(Attempt winner,
-                             BlockingQueue<Attempt> finished,
-                             List<Future<?>> running,
-                             AtomicBoolean settled) {
-        settled.set(true);
-        log.debug("由 {} 勝出", winner.providerName);
-
-        // 落敗者可能還在路上；用另一條虛擬執行緒把它們收乾淨，不要讓呼叫端等
-        executor.submit(() -> {
-            running.forEach(future -> future.cancel(true));
-            drainAndClose(finished);
-        });
-        return winner.stream;
-    }
-
-    /** 把佇列裡殘留的串流關掉。每一條沒關的串流都是還在計費的上游請求 */
-    private void drainAndClose(BlockingQueue<Attempt> finished) {
-        Attempt pending;
-        while ((pending = finished.poll()) != null) {
-            if (pending.stream != null) pending.stream.close();
-        }
-    }
-
-    private Attempt pollFor(BlockingQueue<Attempt> queue, Duration timeout) {
-        try {
-            return queue.poll(timeout.toMillis(), TimeUnit.MILLISECONDS);
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new ProviderException("hedging", ProviderException.Kind.TIMEOUT, 504, "等待候選回應時被中斷", interrupted);
-        }
-    }
-
-    private ProviderException toProviderException(LlmProvider provider, RuntimeException error) {
-        if (error instanceof ProviderException providerException) return providerException;
-        return new ProviderException(provider.name(), ProviderException.Kind.CONNECTION, 502,
-                error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage(), error);
-    }
-
-    private ProviderException noCandidateSucceeded(ChatRequest request, List<ProviderException> failures) {
-        if (failures.isEmpty()) {
-            return new ProviderException("hedging", ProviderException.Kind.TIMEOUT, 504,
-                    "所有候選都在 %s 內未回應（model=%s）".formatted(attemptTimeout, request.model()), null);
-        }
-        // 保留第一個失敗作為 cause：多數情況下主要 Provider 的錯誤才是根因，
-        // 備援的失敗常常只是「主要掛了所以全都掛了」的延伸
-        ProviderException primary = failures.get(0);
-        return new ProviderException("hedging", primary.kind(), primary.statusCode(),
-                "所有 %d 個候選都失敗，第一個錯誤：%s".formatted(failures.size(), primary.getMessage()), primary);
-    }
-
     @Override
     public void close() {
         executor.close();
-    }
-
-    private record Attempt(String providerName, ChatStream stream, ProviderException failure) {
-        boolean succeeded() {
-            return stream != null;
-        }
     }
 }

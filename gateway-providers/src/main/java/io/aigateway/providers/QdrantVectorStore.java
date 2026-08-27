@@ -15,7 +15,6 @@ import java.util.Map;
 import java.util.Set;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.aigateway.core.ProviderException;
 import io.aigateway.core.RetrievedDocument;
 import io.aigateway.core.VectorStore;
@@ -28,7 +27,6 @@ import io.aigateway.core.VectorStore;
  */
 public class QdrantVectorStore implements VectorStore {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
     /** 判斷 collection 用哪個模型建的時候抽樣幾筆 */
     private static final int MODEL_SAMPLE_SIZE = 64;
 
@@ -120,7 +118,7 @@ public class QdrantVectorStore implements VectorStore {
 
         builder.method(method, body == null
                 ? HttpRequest.BodyPublishers.noBody()
-                : HttpRequest.BodyPublishers.ofString(writeJson(body), StandardCharsets.UTF_8));
+                : HttpRequest.BodyPublishers.ofString(ProviderJson.write("qdrant", body), StandardCharsets.UTF_8));
 
         HttpResponse<String> response;
         try {
@@ -138,19 +136,7 @@ public class QdrantVectorStore implements VectorStore {
                             response.body().substring(0, Math.min(200, response.body().length()))), null);
         }
 
-        try {
-            return MAPPER.readTree(response.body());
-        } catch (IOException error) {
-            throw new ProviderException("qdrant", ProviderException.Kind.SERVER_ERROR, 502,
-                    "向量庫回應不是合法的 JSON", error);
-        }
+        return ProviderJson.readTree("qdrant", response.body(), "向量庫回應");
     }
 
-    private String writeJson(Object value) {
-        try {
-            return MAPPER.writeValueAsString(value);
-        } catch (IOException error) {
-            throw new ProviderException("qdrant", ProviderException.Kind.BAD_REQUEST, 400, "無法序列化查詢", error);
-        }
-    }
 }
