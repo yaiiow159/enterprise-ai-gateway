@@ -1,0 +1,15 @@
+# GitHub Linguist 是照「位元組數」決定主要語言的，不分產品程式碼與開發工具。
+#
+# 這個 repo 的產品是 Java（gateway-core / gateway-providers / gateway-server，
+# 約 141 KB），但 .claude/ 的 agent skills 與 tools/ 的測試替身、驗證腳本
+# 加起來約 211 KB 的 JavaScript，於是整個 repo 被標成 JavaScript——
+# 對一個 Spring Boot 網關來說是誤導。
+#
+# -linguist-detectable 的語意正好是「不要把這些路徑算進語言統計」，
+# 比 linguist-vendored（意思是第三方程式碼）更貼近實情：
+# 這些是自己寫的開發工具，只是不屬於產品本身。
+#
+# 這兩行只影響 GitHub 的語言統計，不影響 diff、搜尋或任何建置行為。
+
+.claude/**  -linguist-detectable
+tools/**    -linguist-detectable
