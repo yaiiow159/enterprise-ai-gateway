@@ -10,6 +10,7 @@
 const { spawn, execFileSync } = require('node:child_process');
 const http = require('node:http');
 const path = require('node:path');
+const { gatewayAuthHeaders, ensureLocalGatewayKey } = require('./gateway-auth');
 
 const REPO = process.env.REPO || path.resolve(__dirname, '..');
 const JAR = path.join(REPO, 'gateway-server/target/gateway-server-0.0.1-SNAPSHOT.jar');
@@ -24,7 +25,7 @@ const results = [];
 function request(port, method, urlPath, body, extraHeaders) {
     return new Promise((resolve, reject) => {
         const payload = body === undefined ? null : JSON.stringify(body);
-        const headers = Object.assign({}, extraHeaders);
+        const headers = Object.assign(gatewayAuthHeaders(), extraHeaders);
         if (payload) {
             headers['Content-Type'] = 'application/json';
             headers['Content-Length'] = Buffer.byteLength(payload);
@@ -92,7 +93,7 @@ async function restartGateway(extraEnv) {
 
 function chat(overrides) {
     return request(GATEWAY, 'POST', '/v1/chat/completions', Object.assign({
-        model: 'any',
+        model: 'fake-chat',
         messages: [{ role: 'user', content: 'hi' }],
         max_tokens: 5,
     }, overrides));
@@ -196,11 +197,12 @@ async function scenarioCancellation() {
 
     await new Promise(resolve => {
         const payload = JSON.stringify({
-            model: 'any', messages: [{ role: 'user', content: 'hi' }], max_tokens: 100, stream: true,
+            model: 'fake-chat', messages: [{ role: 'user', content: 'hi' }], max_tokens: 100, stream: true,
         });
         const req = http.request({
             host: 'localhost', port: GATEWAY, path: '/v1/chat/completions', method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+            headers: Object.assign(gatewayAuthHeaders(),
+                { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }),
         }, res => {
             let chunks = 0;
             res.on('data', () => { if (++chunks === 3) { req.destroy(); resolve(); } });
@@ -227,14 +229,15 @@ async function scenarioStreamingIncremental() {
 
     const timings = await new Promise((resolve, reject) => {
         const payload = JSON.stringify({
-            model: 'any', messages: [{ role: 'user', content: 'hi' }], max_tokens: 6, stream: true,
+            model: 'fake-chat', messages: [{ role: 'user', content: 'hi' }], max_tokens: 6, stream: true,
         });
         const startedAt = Date.now();
         const arrivals = [];
         let buffer = '';
         const req = http.request({
             host: 'localhost', port: GATEWAY, path: '/v1/chat/completions', method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+            headers: Object.assign(gatewayAuthHeaders(),
+                { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }),
         }, res => {
             res.on('data', chunk => {
                 buffer += chunk;
@@ -304,6 +307,7 @@ async function scenarioProbeRecovery() {
 // ---------- 主流程 ----------
 
 (async () => {
+    ensureLocalGatewayKey();
     try {
         await scenarioRoutingOrder();
         await scenarioFailover();

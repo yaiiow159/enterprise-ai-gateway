@@ -24,6 +24,7 @@
 'use strict';
 
 const http = require('node:http');
+const { gatewayAuthHeaders } = require('../../../tools/gateway-auth');
 
 const GATEWAY_PORT = Number(process.env.GATEWAY_PORT || 8090);
 const FAKE_PORTS = [
@@ -44,7 +45,7 @@ const results = [];
 function json(port, method, path, body) {
     return new Promise((resolve, reject) => {
         const payload = body === undefined ? null : JSON.stringify(body);
-        const headers = {};
+        const headers = gatewayAuthHeaders();
         if (payload) {
             headers['Content-Type'] = 'application/json';
             headers['Content-Length'] = Buffer.byteLength(payload);
@@ -101,7 +102,7 @@ async function totalStats() {
 function streamRequest({ maxTokens = 8, abortAfterChunks = 0 } = {}) {
     return new Promise((resolve, reject) => {
         const payload = JSON.stringify({
-            model: 'any',
+            model: 'fake-chat',
             messages: [{ role: 'user', content: 'hello' }],
             max_tokens: maxTokens,
             stream: true,
@@ -117,7 +118,8 @@ function streamRequest({ maxTokens = 8, abortAfterChunks = 0 } = {}) {
             port: GATEWAY_PORT,
             path: '/v1/chat/completions',
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+            headers: Object.assign(gatewayAuthHeaders(),
+                { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }),
             timeout: 30000,
         }, (response) => {
             headersAt = Date.now() - startedAt;

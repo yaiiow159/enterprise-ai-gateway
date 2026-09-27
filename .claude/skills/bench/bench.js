@@ -43,6 +43,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
+const { gatewayAuthHeaders, ensureLocalGatewayKey } = require('../../../tools/gateway-auth');
 
 const REPO_ROOT = path.resolve(__dirname, '../../..');
 const JAR = path.join(REPO_ROOT, 'gateway-server/target/gateway-server-0.0.1-SNAPSHOT.jar');
@@ -111,7 +112,7 @@ function runWorker() {
     function openStream() {
         return new Promise((resolve) => {
             const payload = JSON.stringify({
-                model: 'any',
+                model: 'fake-chat',
                 messages: [{ role: 'user', content: 'benchmark request' }],
                 max_tokens: config.tokens,
                 stream: true,
@@ -127,7 +128,9 @@ function runWorker() {
                 port: config.port,
                 path: '/v1/chat/completions',
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+                // fork 出來的負載產生器繼承 process.env，key 由主行程的 ensureLocalGatewayKey() 設好
+                headers: Object.assign(gatewayAuthHeaders(),
+                    { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }),
                 timeout: config.timeoutMs,
             }, (response) => {
                 response.on('data', (chunk) => {
@@ -191,7 +194,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function json(port, method, urlPath, body) {
     return new Promise((resolve, reject) => {
         const payload = body === undefined ? null : JSON.stringify(body);
-        const headers = {};
+        const headers = gatewayAuthHeaders();
         if (payload) {
             headers['Content-Type'] = 'application/json';
             headers['Content-Length'] = Buffer.byteLength(payload);
@@ -365,7 +368,7 @@ async function warmup(port) {
         const size = Math.min(batchSize, OPTIONS.warmupRequests - done);
         await Promise.all(Array.from({ length: size }, () =>
             json(port, 'POST', '/v1/chat/completions', {
-                model: 'any', messages: [{ role: 'user', content: 'warmup' }], max_tokens: 3,
+                model: 'fake-chat', messages: [{ role: 'user', content: 'warmup' }], max_tokens: 3,
             }).catch(() => null)));  // 暖機期間的失敗不計入結果
     }
 }
@@ -573,6 +576,7 @@ function writeReport(arms, environment) {
 // ------------------------------------------------------------ 主流程
 
 (async () => {
+    ensureLocalGatewayKey();
     if (!fs.existsSync(JAR)) {
         console.error(`✗ 找不到 ${path.relative(REPO_ROOT, JAR)}，先執行 mvn clean install -DskipTests`);
         process.exit(2);

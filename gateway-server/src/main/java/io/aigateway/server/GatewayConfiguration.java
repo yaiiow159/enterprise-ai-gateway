@@ -2,6 +2,7 @@ package io.aigateway.server;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.util.Set;
 
 import io.aigateway.core.BudgetLedger;
 import io.aigateway.core.GatewayCounters;
@@ -38,18 +39,22 @@ public class GatewayConfiguration {
                     config.getBaseUrl(),
                     config.getApiKey(),
                     config.getModel(),
+                    Set.copyOf(config.getServedModels()),
                     new ModelCapability(
                             config.getContextWindowTokens(),
                             config.getMaxOutputTokens(),
                             config.isSupportsStreaming(),
                             config.isSupportsTools(),
+                            config.isSupportsVision(),
                             config.getInputMicroCentsPerToken(),
                             config.getOutputMicroCentsPerToken()),
                     config.getConnectTimeout(),
-                    config.getRequestTimeout()));
+                    config.getRequestTimeout(),
+                    config.getStreamIdleTimeout(),
+                    config.isStreamUsage()));
             // 只記名稱與位址，不記金鑰
-            log.info("已註冊 Provider {} → {}（model={}）",
-                    config.getName(), config.getBaseUrl(), config.getModel());
+            log.info("已註冊 Provider {} → {}（model={}，服務 {}）", config.getName(), config.getBaseUrl(),
+                    config.getModel(), registry.byName(config.getName()).orElseThrow().servedModels());
         }
 
         if (registry.all().isEmpty()) {

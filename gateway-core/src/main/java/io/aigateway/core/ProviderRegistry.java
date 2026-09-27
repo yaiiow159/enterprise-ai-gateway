@@ -47,14 +47,20 @@ public final class ProviderRegistry {
     }
 
     /**
-     * 能承接這個請求的 Provider。
+     * 能承接這個請求的 Provider：服務該模型名稱，且能力足以處理這個請求。
      *
      * <p>先濾能力再談排序：上下文塞不下、不支援串流的 Provider 不管多快多便宜都不能用，
      * 送出去只是換一個比較慢的失敗。
      */
     public List<LlmProvider> candidatesFor(ChatRequest request) {
         return ordered.stream()
+                .filter(provider -> provider.servedModels().contains(request.model()))
                 .filter(provider -> provider.capability().canHandle(request))
                 .collect(Collectors.toList());
+    }
+
+    /** 是否有任何 Provider 服務這個模型名稱，用來區分「模型不存在」與「能力不足」 */
+    public boolean servesModel(String model) {
+        return ordered.stream().anyMatch(provider -> provider.servedModels().contains(model));
     }
 }

@@ -1,5 +1,7 @@
 package io.aigateway.server;
 
+import java.util.Set;
+
 import io.aigateway.core.BudgetLedger;
 import io.aigateway.core.EmbeddingProvider;
 import io.aigateway.core.RagAugmenter;
@@ -59,14 +61,16 @@ public class RagConfiguration {
     RagAugmenter ragAugmenter(EmbeddingProvider embeddings, VectorStore vectorStore,
                               BudgetLedger budget, GatewayProperties properties) {
         GatewayProperties.Rag rag = properties.getRag();
-        verifyConsistency(vectorStore, rag);
-        return new RagAugmenter(embeddings, vectorStore, budget);
+        Set<String> collections = rag.allowedCollections();
+        // 每一個可以被檢索的 collection 都要檢查；只查預設那一個的話，其他的等於沒有防線
+        collections.forEach(collection -> verifyConsistency(vectorStore, rag, collection));
+        return new RagAugmenter(embeddings, vectorStore, budget, collections);
     }
 
-    private void verifyConsistency(VectorStore vectorStore, GatewayProperties.Rag rag) {
+    private void verifyConsistency(VectorStore vectorStore, GatewayProperties.Rag rag, String collection) {
         VectorStore.CollectionInfo info;
         try {
-            info = vectorStore.describe(rag.getCollection());
+            info = vectorStore.describe(collection);
         } catch (RuntimeException error) {
             // 向量庫連不上與「設定錯了」是不同的問題，訊息要分得開，
             // 否則有人會去改設定而不是去看向量庫
@@ -76,13 +80,13 @@ public class RagConfiguration {
 
         if (info == null) {
             fail(rag, "collection「%s」不存在。先用 tools/rag-index.js 建索引"
-                    .formatted(rag.getCollection()));
+                    .formatted(collection));
             return;
         }
         if (info.pointCount() == 0) {
             // 空索引的檢索結果一律為空，但不會報錯——那是「RAG 沒效果」最無聲的原因
             log.warn("collection「{}」是空的：檢索會一律回傳空結果，但不會有任何錯誤",
-                    rag.getCollection());
+                    collection);
         }
         if (info.dimension() != rag.getEmbeddingDimension()) {
             fail(rag, "維度不符：collection 是 %d 維，設定是 %d 維"
@@ -92,7 +96,7 @@ public class RagConfiguration {
         if (info.embeddingModel() == null) {
             fail(rag, ("collection「%s」的 point 沒有宣告 _embedding_model，或混雜了多個模型。"
                     + "前者代表索引不是由 rag-index 建的，後者代表重建索引跑到一半中斷")
-                    .formatted(rag.getCollection()));
+                    .formatted(collection));
             return;
         }
         if (!info.embeddingModel().equals(rag.getEmbeddingModel())) {

@@ -24,6 +24,7 @@
 const { spawn, spawnSync } = require('node:child_process');
 const http = require('node:http');
 const path = require('node:path');
+const { gatewayAuthHeaders, ensureLocalGatewayKey } = require('./gateway-auth');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const JAR = path.join(REPO_ROOT, 'gateway-server/target/gateway-server-0.0.1-SNAPSHOT.jar');
@@ -43,7 +44,7 @@ function check(name, passed, detail) {
 function request(port, method, urlPath, body) {
     return new Promise((resolve) => {
         const payload = body === undefined ? null : JSON.stringify(body);
-        const headers = {};
+        const headers = port === GATEWAY_PORT ? gatewayAuthHeaders() : {};
         if (payload) {
             headers['Content-Type'] = 'application/json';
             headers['Content-Length'] = Buffer.byteLength(payload);
@@ -133,7 +134,7 @@ function buildIndex(model) {
 }
 
 const ask = (extra) => request(GATEWAY_PORT, 'POST', '/v1/chat/completions', Object.assign({
-    model: 'any',
+    model: 'fake-chat',
     messages: [{ role: 'user', content: 'token bucket rate limit' }],
     max_tokens: 10,
 }, extra));
@@ -202,11 +203,14 @@ async function scenarioMissingCollection() {
 async function scenarioFailureSemantics() {
     console.log('\n[6] 檢索失敗：預設失敗，降級要明確 opt-in');
     buildIndex('fake-embed-v1');
-    const up = await startGateway({ RAG_EMBEDDING_MODEL: 'fake-embed-v1', RAG_EMBEDDING_DIM: '32' });
+    // 嵌入服務指向沒有人聽的埠來模擬檢索失敗。啟動檢查只看向量庫，所以網關起得來，
+    // 失敗發生在請求當下。不能再用不存在的 collection：那會先被允許清單擋下，走不到檢索
+    const up = await startGateway({
+        RAG_EMBEDDING_MODEL: 'fake-embed-v1', RAG_EMBEDDING_DIM: '32', RAG_EMBEDDING_URL: 'http://localhost:9199',
+    });
     if (!up) { check('前置：網關就緒', false, '未就緒'); return; }
 
-    // 指向一個不存在的 collection 來模擬檢索失敗（向量庫本身還活著）
-    const failing = { collection: '_gone_', top_k: 3 };
+    const failing = { collection: 'docs', top_k: 3 };
 
     const strict = await ask({ x_rag: failing });
     check('預設不降級，直接失敗', strict.status >= 400,
@@ -218,6 +222,17 @@ async function scenarioFailureSemantics() {
         lenient.status === 200 && rag?.degraded === true,
         `HTTP ${lenient.status}，degraded=${rag?.degraded}`);
     check('降級時回報原因', Boolean(rag?.note), `note=${rag?.note?.slice(0, 60)}`);
+}
+
+async function scenarioCollectionNotAllowed() {
+    console.log('\n[8] 不在允許清單的 collection 一律拒絕，即使要求降級');
+    buildIndex('fake-embed-v1');
+    const up = await startGateway({ RAG_EMBEDDING_MODEL: 'fake-embed-v1', RAG_EMBEDDING_DIM: '32' });
+    if (!up) { check('前置：網關就緒', false, '未就緒'); return; }
+
+    // 允許任意 collection 等於繞過啟動時的嵌入一致性檢查，也能讀別人的知識庫
+    const response = await ask({ x_rag: { collection: '_someone_else_', top_k: 3, degrade_on_failure: true } });
+    check('回 400 而不是降級成沒有依據的答案', response.status === 400, `HTTP ${response.status}`);
 }
 
 async function scenarioNotEnabled() {
@@ -233,6 +248,7 @@ async function scenarioNotEnabled() {
 // ---------------------------------------------------------------- 主流程
 
 (async () => {
+    ensureLocalGatewayKey();
     console.log('RAG 端到端驗證');
 
     const qdrant = await request(6333, 'GET', '/collections');
@@ -248,6 +264,7 @@ async function scenarioNotEnabled() {
         await scenarioDimensionMismatch();
         await scenarioMissingCollection();
         await scenarioFailureSemantics();
+        await scenarioCollectionNotAllowed();
         await scenarioNotEnabled();
     } catch (error) {
         console.error(`\n驗證中斷：${error.message}`);

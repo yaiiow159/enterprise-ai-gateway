@@ -44,7 +44,7 @@ public final class InMemoryBudgetLedger extends AbstractBudgetLedger {
 
     @Override
     public Reservation reserve(String tenant, long estimatedMicroCents) {
-        rolloverIfNeeded();
+        LocalDate day = rolloverIfNeeded();
         String key = keyFor(tenant);
         long amount = Math.max(0, estimatedMicroCents);
 
@@ -54,21 +54,32 @@ public final class InMemoryBudgetLedger extends AbstractBudgetLedger {
         long tenantAfter = counter(key).addAndGet(amount);
 
         if (dailyLimitMicroCents() > 0 && globalAfter > dailyLimitMicroCents()) {
-            release(key, amount);
+            add(key, -amount);
             throw exceeded("全域", globalAfter - amount, dailyLimitMicroCents(), amount);
         }
         if (perTenantLimitMicroCents() > 0 && tenantAfter > perTenantLimitMicroCents()) {
-            release(key, amount);
+            add(key, -amount);
             throw exceeded("租戶 " + key, tenantAfter - amount, perTenantLimitMicroCents(), amount);
         }
 
-        return new Reservation(key, amount);
+        return new Reservation(key, amount, day, false);
+    }
+
+    /**
+     * 預扣當天已經不是今天的話，差額直接捨棄：那一天的帳在跨日時已經歸零，
+     * 把退款記進今天會讓今天的額度憑空變大。
+     */
+    @Override
+    protected void applyDelta(Reservation reservation, long delta) {
+        if (!rolloverIfNeeded().equals(reservation.day())) return;
+        add(reservation.tenant(), delta);
     }
 
     @Override
-    protected void applyDelta(String tenantKey, long delta) {
-        counter(GLOBAL).addAndGet(delta);
-        counter(tenantKey).addAndGet(delta);
+    public void record(String tenant, long microCents) {
+        if (microCents <= 0) return;
+        rolloverIfNeeded();
+        add(keyFor(tenant), microCents);
     }
 
     @Override
@@ -77,9 +88,9 @@ public final class InMemoryBudgetLedger extends AbstractBudgetLedger {
         return counter(tenant == null ? GLOBAL : keyFor(tenant)).get();
     }
 
-    private void release(String key, long amount) {
-        counter(GLOBAL).addAndGet(-amount);
-        counter(key).addAndGet(-amount);
+    private void add(String key, long amount) {
+        counter(GLOBAL).addAndGet(amount);
+        counter(key).addAndGet(amount);
     }
 
     private AtomicLong counter(String key) {
@@ -91,18 +102,21 @@ public final class InMemoryBudgetLedger extends AbstractBudgetLedger {
      *
      * <p>用 UTC 日期而不是本地時區：多節點部署在不同時區時，各自在不同時刻歸零，
      * 全域上限就會出現一段兩邊都以為自己是新的一天的空窗。
+     *
+     * @return 今天（歸零之後的帳所屬的日期）
      */
-    private void rolloverIfNeeded() {
+    private LocalDate rolloverIfNeeded() {
         LocalDate today = LocalDate.now(clock);
-        if (today.equals(currentDay)) return;
+        if (today.equals(currentDay)) return today;
 
         rolloverLock.lock();
         try {
-            if (today.equals(currentDay)) return;
+            if (today.equals(currentDay)) return today;
             log.info("成本帳本跨日歸零：{} → {}（前一日全域支出 {} 微美分）",
                     currentDay, today, counter(GLOBAL).get());
             spend.clear();
             currentDay = today;
+            return today;
         } finally {
             rolloverLock.unlock();
         }

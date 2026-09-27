@@ -10,7 +10,8 @@ node .claude/skills/stream-check/check.js
 node .claude/skills/stream-check/check.js --verbose
 ```
 
-前置條件：`dev-stack` 已啟動，且網關正在 8090 埠執行。
+前置條件：`dev-stack` 已啟動，且網關正在 8090 埠執行。網關開著 API key 驗證時，
+把要送的 key 放在環境變數 `GATEWAY_API_KEY`（由 `release-check` 執行時會自動設定）。
 埠可用 `GATEWAY_PORT`／`FAKE_FAST_PORT`／`FAKE_SLOW_PORT`／`FAKE_FLAKY_PORT` 覆寫。
 
 ## 為什麼需要專門的工具

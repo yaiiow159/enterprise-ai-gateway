@@ -35,6 +35,11 @@ public class ProviderException extends RuntimeException {
         return kind.retryable;
     }
 
+    /** 這個錯誤是不是 Provider 本身的問題，要不要算進它的失敗率 */
+    public boolean countsAgainstProvider() {
+        return kind.countsAgainstProvider;
+    }
+
     /**
      * HTTP 狀態碼 → 錯誤分類。
      *
@@ -44,28 +49,43 @@ public class ProviderException extends RuntimeException {
      * （一邊 BAD_REQUEST 不重試、一邊 SERVER_ERROR 會重試），
      * 而兩邊各自看起來都正確，沒有任何測試會失敗。
      *
-     * <p>統一採用「4xx 一律不重試」：請求本身有問題時，換誰都是一樣的結果，
-     * 重試只是多等一次、多付一次錢。
+     * <p>判斷的依據是「問題出在誰身上」：401／403／404 是**這一家**的金鑰、權限或端點設定，
+     * 換一家不受影響；其餘 4xx 是請求本身，同一模型群組裡換誰都一樣。
      */
     public static Kind kindForHttpStatus(int status) {
         return switch (status) {
             case 401, 403 -> Kind.AUTHENTICATION;
+            case 404 -> Kind.UPSTREAM_NOT_FOUND;
+            case 408 -> Kind.TIMEOUT;
             case 429 -> Kind.RATE_LIMITED;
             default -> status >= 500 ? Kind.SERVER_ERROR : Kind.BAD_REQUEST;
         };
     }
 
+    /**
+     * 兩個獨立的屬性：
+     * <ul>
+     *   <li><b>retryable</b>——換一家有沒有機會成功。</li>
+     *   <li><b>countsAgainstProvider</b>——要不要拉低這一家的健康度。請求本身的錯誤不算：
+     *       否則一個一直送壞請求的租戶，能把健康的 Provider 拉進降級與探測。</li>
+     * </ul>
+     */
     public enum Kind {
-        RATE_LIMITED(true),
-        SERVER_ERROR(true),
-        TIMEOUT(true),
-        CONNECTION(true),
-        /** 請求本身有問題，換一家 Provider 也一樣會失敗 */
-        BAD_REQUEST(false),
-        AUTHENTICATION(false),
-        CONTENT_FILTERED(false),
+        RATE_LIMITED(true, true),
+        SERVER_ERROR(true, true),
+        TIMEOUT(true, true),
+        CONNECTION(true, true),
+        /** 請求本身有問題，同一模型群組裡換誰都一樣會失敗 */
+        BAD_REQUEST(false, false),
+        /** 沒有任何 Provider 服務呼叫端要求的模型名稱 */
+        MODEL_NOT_FOUND(false, false),
+        /** 上游拒絕的是這一家的金鑰或權限；別家有自己的金鑰，換一家不受影響 */
+        AUTHENTICATION(true, true),
+        /** 上游回 404：這一家的端點或模型名稱設定錯了 */
+        UPSTREAM_NOT_FOUND(true, true),
+        CONTENT_FILTERED(false, false),
         /** 上游在串流中途斷線 */
-        STREAM_ABORTED(true),
+        STREAM_ABORTED(true, true),
         /**
          * 已達每日成本上限。
          *
@@ -73,12 +93,14 @@ public class ProviderException extends RuntimeException {
          * 這個分類存在的意義就是不讓它落進「5xx 就換一家再試」那條路徑，
          * 否則超支時反而會把每個請求都打滿所有候選。
          */
-        BUDGET_EXCEEDED(false);
+        BUDGET_EXCEEDED(false, false);
 
         final boolean retryable;
+        final boolean countsAgainstProvider;
 
-        Kind(boolean retryable) {
+        Kind(boolean retryable, boolean countsAgainstProvider) {
             this.retryable = retryable;
+            this.countsAgainstProvider = countsAgainstProvider;
         }
     }
 }

@@ -17,6 +17,10 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class ProviderStats {
 
     private static final int WINDOW = 128;
+    private static final int BUCKET_WINDOW = 64;
+    /** 樣本少於這個數時不推估分位數：兩三個樣本算出的 p95 極不穩定，會讓路由亂跳 */
+    private static final int MIN_SAMPLES = 8;
+    private static final long[] BUCKET_UPPER_BOUNDS = { 1_000, 8_000, 32_000 };
 
     private static final byte UNSET = -1;
     private static final byte SUCCESS = 0;
@@ -25,6 +29,9 @@ public final class ProviderStats {
     private final String providerName;
     private final long[] ttftSamples = new long[WINDOW];
     private final AtomicLong sampleCount = new AtomicLong();
+    private final Bucket[] buckets = {
+            new Bucket(), new Bucket(), new Bucket(), new Bucket()
+    };
 
     /**
      * 最近 {@value #WINDOW} 次嘗試的成敗，與 TTFT 用同一個窗口大小。
@@ -64,12 +71,31 @@ public final class ProviderStats {
         return providerName;
     }
 
-    public void recordTtft(Duration ttft) {
+    /**
+     * 記錄一次首字延遲。
+     *
+     * @param promptTokens 這次請求的估算輸入 token 數，決定樣本落在哪個長度區段
+     */
+    public void recordTtft(Duration ttft, long promptTokens) {
         long index = sampleCount.getAndIncrement();
         // 環狀寫入；容忍極少數的競態覆寫，統計值不需要精確到單筆
         ttftSamples[(int) (index % WINDOW)] = ttft.toMillis();
+        buckets[bucketOf(promptTokens)].record(ttft.toMillis());
         totalSuccesses.incrementAndGet();
         recordOutcome(SUCCESS);
+    }
+
+    /**
+     * 同樣長度區段的 TTFT 分位數；該區段樣本不足時退回整體分位數。
+     *
+     * <p>首字延遲和 prompt 長度強相關（預填階段隨輸入線性成長）。只用整體分位數判斷要不要對沖的話，
+     * 長 prompt 幾乎每次都超過「整體 p95」，於是對沖集中發生在最長、也最貴的請求上——
+     * 輸入 token 兩家都付，實際多花的錢遠高於「約 5% 的請求」這個直覺。
+     */
+    public Duration ttftPercentile(double percentile, Duration fallback, long promptTokens) {
+        long[] bucketSnapshot = buckets[bucketOf(promptTokens)].snapshot();
+        if (bucketSnapshot.length >= MIN_SAMPLES) return percentileOf(bucketSnapshot, percentile);
+        return ttftPercentile(percentile, fallback);
     }
 
     public void recordFailure() {
@@ -88,9 +114,40 @@ public final class ProviderStats {
      */
     public Duration ttftPercentile(double percentile, Duration fallback) {
         long[] snapshot = Arrays.stream(ttftSamples).filter(value -> value >= 0).sorted().toArray();
-        if (snapshot.length < 8) return fallback;
-        int index = Math.min(snapshot.length - 1, (int) Math.floor(snapshot.length * percentile));
-        return Duration.ofMillis(snapshot[index]);
+        if (snapshot.length < MIN_SAMPLES) return fallback;
+        return percentileOf(snapshot, percentile);
+    }
+
+    /** @param sorted 已排序、至少一筆 */
+    private static Duration percentileOf(long[] sorted, double percentile) {
+        int index = Math.min(sorted.length - 1, (int) Math.floor(sorted.length * percentile));
+        return Duration.ofMillis(sorted[index]);
+    }
+
+    /** 輸入長度區段的上界（不含）：1k、8k、32k，之後全部歸最後一段 */
+    private static int bucketOf(long promptTokens) {
+        for (int index = 0; index < BUCKET_UPPER_BOUNDS.length; index++) {
+            if (promptTokens < BUCKET_UPPER_BOUNDS[index]) return index;
+        }
+        return BUCKET_UPPER_BOUNDS.length;
+    }
+
+    /** 單一長度區段的環狀樣本 */
+    private static final class Bucket {
+        private final long[] samples = new long[BUCKET_WINDOW];
+        private final AtomicLong count = new AtomicLong();
+
+        Bucket() {
+            Arrays.fill(samples, -1);
+        }
+
+        void record(long millis) {
+            samples[(int) (count.getAndIncrement() % BUCKET_WINDOW)] = millis;
+        }
+
+        long[] snapshot() {
+            return Arrays.stream(samples).filter(value -> value >= 0).sorted().toArray();
+        }
     }
 
     /**

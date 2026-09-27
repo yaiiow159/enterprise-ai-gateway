@@ -26,6 +26,7 @@ const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+const { ensureLocalGatewayKey } = require('../../../tools/gateway-auth');
 
 const REPO_ROOT = path.resolve(__dirname, '../../..');
 const JAR = path.join(REPO_ROOT, 'gateway-server/target/gateway-server-0.0.1-SNAPSHOT.jar');
@@ -279,6 +280,8 @@ function writeReport(results) {
 // ------------------------------------------------------------ 主流程
 
 (async () => {
+    // 自己啟動的網關與底下各項檢查（spawnSync，繼承 process.env）共用這一把 key
+    ensureLocalGatewayKey();
     console.log(`發版把關${FULL ? '（完整，含壓測與多節點驗證）' : ''}\n`);
     await preflight();
 

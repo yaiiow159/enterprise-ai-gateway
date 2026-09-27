@@ -1,5 +1,7 @@
 package io.aigateway.core;
 
+import java.time.LocalDate;
+
 /**
  * 每日成本上限。
  *
@@ -17,11 +19,9 @@ package io.aigateway.core;
  * 實際成本出來後再結算差額。方向刻意保守：寧可暫時擋掉一個本來付得起的請求，
  * 也不要放行一批合起來超支的請求。
  *
- * <h2>已知限制：這是單節點的帳</h2>
- * 目前的實作把帳記在行程記憶體裡。多節點部署時每個節點各記各的，
- * 實際的總支出上限會變成 <b>節點數 × 設定值</b>。
- * 要真正的全域上限，帳必須記在共用儲存（Redis）而不是各自的記憶體裡——
- * 與熔斷器狀態同理。這件事記在 CLAUDE.md 的待釐清問題裡。
+ * <h2>兩種實作</h2>
+ * {@link InMemoryBudgetLedger} 是單節點的帳，多節點時實際總上限是節點數的倍數；
+ * {@link RedisBudgetLedger} 讓多節點共用同一份帳。
  */
 public interface BudgetLedger {
 
@@ -40,15 +40,28 @@ public interface BudgetLedger {
      */
     void settle(Reservation reservation, long actualMicroCents);
 
+    /**
+     * 記下一筆**已經發生**、沒有對應預扣的支出，例如對沖落敗者已被計費的輸入 token。
+     *
+     * <p>不做上限檢查也不拋例外：錢已經花掉了，拒絕記帳只會讓帳本低估，
+     * 而低估正是讓上限在「對沖被設成無條件」這類情境下失效的原因。
+     */
+    void record(String tenant, long microCents);
+
     /** 目前這一天某個租戶已經花掉的金額。tenant 為 null 時回傳全域總額 */
     long spentMicroCents(String tenant);
 
     /** 0 表示沒有設定上限 */
     long dailyLimitMicroCents();
 
-    /** 一次預扣。金額用整數微美分，不用浮點數——這是要拿去跟帳單對帳的數字 */
-    record Reservation(String tenant, long amountMicroCents) {
-        public static final Reservation NONE = new Reservation(null, 0);
+    /**
+     * 一次預扣。金額用整數微美分，不用浮點數——這是要拿去跟帳單對帳的數字。
+     *
+     * @param day      預扣記在哪一天的帳上。結算必須回到同一天，跨日結算才不會把退款記進新的一天
+     * @param degraded 共用帳本不可用、改記在本地備用帳本上。結算必須回到同一本帳
+     */
+    record Reservation(String tenant, long amountMicroCents, LocalDate day, boolean degraded) {
+        public static final Reservation NONE = new Reservation(null, 0, null, false);
     }
 
     /**
@@ -67,6 +80,11 @@ public interface BudgetLedger {
             @Override
             public void settle(Reservation reservation, long actualMicroCents) {
                 // 沒有上限就沒有帳可結
+            }
+
+            @Override
+            public void record(String tenant, long microCents) {
+                // 沒有上限就沒有帳可記
             }
 
             @Override

@@ -10,6 +10,7 @@ package io.aigateway.core;
  * @param maxOutputTokens         單次輸出上限
  * @param supportsStreaming       是否支援串流
  * @param supportsTools           是否支援工具／函式呼叫
+ * @param supportsVision          是否接受圖片輸入
  * @param inputMicroCentsPerToken 每個輸入 token 的成本（百萬分之一美分）
  * @param outputMicroCentsPerToken 每個輸出 token 的成本
  */
@@ -18,6 +19,7 @@ public record ModelCapability(
         int maxOutputTokens,
         boolean supportsStreaming,
         boolean supportsTools,
+        boolean supportsVision,
         long inputMicroCentsPerToken,
         long outputMicroCentsPerToken) {
 
@@ -29,6 +31,9 @@ public record ModelCapability(
     /** 這個模型能不能承接這個請求。不能的話路由階段就要濾掉，而不是送出去等 Provider 報錯 */
     public boolean canHandle(ChatRequest request) {
         if (request.stream() && !supportsStreaming) return false;
+        // 不支援工具的模型收到 tools 時多半靜靜忽略——呼叫端拿到一個沒呼叫工具的答案，卻不知道為什麼
+        if (request.usesTools() && !supportsTools) return false;
+        if (request.hasImages() && !supportsVision) return false;
         if (request.maxTokens() > maxOutputTokens) return false;
         return request.estimatedPromptTokens() + request.maxTokens() <= contextWindowTokens;
     }

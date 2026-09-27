@@ -105,14 +105,18 @@ public final class HedgingChatClient implements AutoCloseable {
     }
 
     private ChatStream dispatch(ChatRequest request, List<LlmProvider> candidates) {
+        // 落敗者的成本沒有對應的預扣，直接記成已發生的支出。
+        // 不記的話，對沖被設成 immediate 時實際花費是 N 倍、帳本只看得到 1 倍，
+        // 每日上限正好在它要防的情境裡失效
         return new CandidateRace(request, candidates, registry, hedgePolicy, counters,
-                executor, attemptTimeout).run();
+                executor, attemptTimeout, cost -> budget.record(request.tenant(), cost)).run();
     }
 
     /** 非串流呼叫。內部沿用同一套對沖邏輯，讀完串流後組成完整回應 */
     public ChatResponse complete(ChatRequest request) {
         long startedAt = System.nanoTime();
         StringBuilder content = new StringBuilder();
+        ToolCallAccumulator toolCalls = new ToolCallAccumulator();
         Usage usage = Usage.EMPTY;
         ChatChunk.FinishReason finishReason = ChatChunk.FinishReason.STOP;
         String providerName;
@@ -122,6 +126,7 @@ public final class HedgingChatClient implements AutoCloseable {
             while (stream.hasNext()) {
                 ChatChunk chunk = stream.next();
                 if (chunk.delta() != null) content.append(chunk.delta());
+                toolCalls.add(chunk.toolCalls());
                 if (chunk.usage() != null) usage = chunk.usage();
                 if (chunk.finishReason() != null) finishReason = chunk.finishReason();
             }
@@ -134,7 +139,8 @@ public final class HedgingChatClient implements AutoCloseable {
                 content.toString(),
                 finishReason,
                 usage,
-                Duration.ofNanos(System.nanoTime() - startedAt).toMillis());
+                Duration.ofNanos(System.nanoTime() - startedAt).toMillis(),
+                toolCalls.result());
     }
 
     /**
@@ -145,10 +151,14 @@ public final class HedgingChatClient implements AutoCloseable {
      * 而失敗切換本來就會兜住——這正是那個機制存在的理由。
      */
     private Candidates orderedCandidates(ChatRequest request) {
+        if (!registry.servesModel(request.model())) {
+            throw new ProviderException("routing", ProviderException.Kind.MODEL_NOT_FOUND, 404,
+                    "沒有 Provider 服務模型「%s」".formatted(request.model()), null);
+        }
         List<LlmProvider> available = registry.candidatesFor(request);
         if (available.isEmpty()) {
             throw new ProviderException("routing", ProviderException.Kind.BAD_REQUEST, 400,
-                    "沒有 Provider 能承接這個請求（檢查上下文長度、串流支援與 maxTokens）", null);
+                    "沒有 Provider 能承接這個請求（檢查上下文長度、maxTokens、串流、工具與圖片支援）", null);
         }
 
         List<LlmProvider> ordered = new ArrayList<>(routing.order(request, available, registry));
