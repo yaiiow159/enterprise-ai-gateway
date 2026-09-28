@@ -10,6 +10,7 @@ const { spawn, spawnSync } = require('node:child_process');
 const http = require('node:http');
 
 const path = require('node:path');
+const { gatewayAuthHeaders, ensureLocalGatewayKey } = require('./gateway-auth');
 const REPO_ROOT = path.resolve(__dirname, '..');
 const JAR = path.join(REPO_ROOT, 'gateway-server/target/gateway-server-0.0.1-SNAPSHOT.jar');
 const PORTS = [8090, 8091];
@@ -19,7 +20,7 @@ const children = [];
 function json(port, method, path, body) {
     return new Promise((resolve, reject) => {
         const payload = body === undefined ? null : JSON.stringify(body);
-        const headers = {};
+        const headers = gatewayAuthHeaders();
         if (payload) { headers['Content-Type'] = 'application/json'; headers['Content-Length'] = Buffer.byteLength(payload); }
         const req = http.request({ host: 'localhost', port, path, method, headers, timeout: 20000 }, res => {
             let d = ''; res.on('data', c => { d += c; });
@@ -83,7 +84,7 @@ async function drive(backend, attempts) {
     for (let i = 0; i < attempts; i++) {
         const port = PORTS[i % PORTS.length];
         const r = await json(port, 'POST', '/v1/chat/completions',
-            { model: 'any', messages: [{ role: 'user', content: 'hi' }], max_tokens: 10 });
+            { model: 'fake-chat', messages: [{ role: 'user', content: 'hi' }], max_tokens: 10 });
         if (r.status === 200) accepted += 1;
     }
 
@@ -97,6 +98,7 @@ async function drive(backend, attempts) {
 }
 
 (async () => {
+    ensureLocalGatewayKey();
     for (const p of [9101, 9102, 9103]) {
         await json(p, 'POST', '/_fake/reset');
         await json(p, 'PUT', '/_fake/config', { errorRate: 0, ttftMs: 30, tokenDelayMs: 1, tokens: 40 });

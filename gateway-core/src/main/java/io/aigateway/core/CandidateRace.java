@@ -10,6 +10,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongConsumer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,6 +49,15 @@ final class CandidateRace {
     private final GatewayCounters counters;
     private final ExecutorService executor;
     private final long deadlineNanos;
+    /**
+     * 收到被中止的候選已經產生的成本。
+     *
+     * <p>輸入 token 在請求送出時就計費，中止不會退款；落敗者若已吐出第一個 token，
+     * 那段輸出也算錢。這筆錢不進帳本的話，對沖越多、帳本低估得越多。
+     */
+    private final LongConsumer abandonedCost;
+    /** 估算要走訪所有訊息，一場賽跑只算一次 */
+    private final long promptTokens;
 
     /** 已經有人勝出。落敗者看到它就知道要中止自己的上游連線 */
     private final AtomicBoolean settled = new AtomicBoolean();
@@ -65,7 +75,8 @@ final class CandidateRace {
                   HedgePolicy hedgePolicy,
                   GatewayCounters counters,
                   ExecutorService executor,
-                  Duration attemptTimeout) {
+                  Duration attemptTimeout,
+                  LongConsumer abandonedCost) {
         this.request = request;
         this.candidates = candidates;
         this.registry = registry;
@@ -73,6 +84,8 @@ final class CandidateRace {
         this.counters = counters;
         this.executor = executor;
         this.deadlineNanos = System.nanoTime() + attemptTimeout.toNanos();
+        this.abandonedCost = abandonedCost;
+        this.promptTokens = request.estimatedPromptTokens();
         this.finished = new ArrayBlockingQueue<>(Math.max(1, candidates.size()));
     }
 
@@ -138,7 +151,8 @@ final class CandidateRace {
         if (!haveSpareCandidate()) return Optional.empty();
 
         ProviderStats primaryStats = registry.statsFor(candidates.get(0).name());
-        Optional<Duration> delay = hedgePolicy.delayBeforeNextAttempt(hedgesLaunched, primaryStats);
+        Optional<Duration> delay =
+                hedgePolicy.delayBeforeNextAttempt(hedgesLaunched, primaryStats, promptTokens);
 
         // 對沖點比整體逾時還晚的話就沒有意義了，那時候請求早就該放棄
         return delay.filter(value -> value.compareTo(untilDeadline()) < 0);
@@ -183,15 +197,21 @@ final class CandidateRace {
                         "上游未送出任何內容就結束", null);
             }
             ChatChunk first = stream.next();
-            stats.recordTtft(Duration.ofNanos(System.nanoTime() - startedAt));
+            stats.recordTtft(Duration.ofNanos(System.nanoTime() - startedAt), promptTokens);
 
             if (settled.get()) {
                 // 已經有人勝出，這條是輸家：立刻中止上游，不要繼續產生 token
                 stream.close();
                 stats.recordCancelled();
+                abandonedCost.accept(costOf(provider, true));
                 return;
             }
-            finished.offer(new Attempt(provider.name(), ChatStream.withPrefetched(first, stream), null));
+            Attempt success = new Attempt(provider, ChatStream.withPrefetched(first, stream), null);
+            finished.offer(success);
+
+            // 檢查 settled 與 offer 之間，勝者可能已經清空過佇列。那時這條串流會留在佇列裡
+            // 沒人關，上游繼續計費。自己再撿回來：remove 成功代表沒有別人會處理它
+            if (settled.get() && finished.remove(success)) abandon(success);
         } catch (RuntimeException error) {
             if (stream != null) stream.close();
 
@@ -201,18 +221,38 @@ final class CandidateRace {
                 // 一次對沖落敗會變成永久降級。落敗只代表「這次比較慢」，不代表「壞掉」。
                 log.debug("{} 在對沖中落敗並已中止", provider.name());
                 stats.recordCancelled();
+                abandonedCost.accept(costOf(provider, false));
                 return;
             }
-            stats.recordFailure();
-            finished.offer(new Attempt(provider.name(), null, asProviderException(provider, error)));
+            ProviderException failure = asProviderException(provider, error);
+            if (failure.countsAgainstProvider()) stats.recordFailure();
+            finished.offer(new Attempt(provider, null, failure));
         }
+    }
+
+    /**
+     * 被中止的候選已經產生的成本：輸入 token 全額，已讀出第一個 chunk 的再加一個輸出 token。
+     *
+     * @param producedOutput 是否已經讀到第一個 chunk
+     */
+    private long costOf(LlmProvider provider, boolean producedOutput) {
+        ModelCapability capability = provider.capability();
+        long input = promptTokens * capability.inputMicroCentsPerToken();
+        return producedOutput ? input + capability.outputMicroCentsPerToken() : input;
+    }
+
+    /** 關掉一條已經讀出第一個 chunk、但沒有勝出的串流，並記下它的成本 */
+    private void abandon(Attempt attempt) {
+        attempt.stream.close();
+        registry.statsFor(attempt.provider.name()).recordCancelled();
+        abandonedCost.accept(costOf(attempt.provider, true));
     }
 
     // ------------------------------------------------------------ 收尾
 
     private ChatStream claim(Attempt winner) {
         settled.set(true);
-        log.debug("由 {} 勝出", winner.providerName);
+        log.debug("由 {} 勝出", winner.provider.name());
 
         // 落敗者可能還在路上；用另一條虛擬執行緒把它們收乾淨，不要讓呼叫端等
         executor.submit(this::abandonAll);
@@ -230,7 +270,7 @@ final class CandidateRace {
 
         Attempt pending;
         while ((pending = finished.poll()) != null) {
-            if (pending.stream != null) pending.stream.close();
+            if (pending.succeeded()) abandon(pending);
         }
     }
 
@@ -262,7 +302,18 @@ final class CandidateRace {
                 "所有 %d 個候選都失敗，第一個錯誤：%s".formatted(failures.size(), primary.getMessage()), primary);
     }
 
-    private record Attempt(String providerName, ChatStream stream, ProviderException failure) {
+    /** 用物件同一性比對：佇列的 remove 要撿回的是「自己放進去的那一個」 */
+    private static final class Attempt {
+        private final LlmProvider provider;
+        private final ChatStream stream;
+        private final ProviderException failure;
+
+        Attempt(LlmProvider provider, ChatStream stream, ProviderException failure) {
+            this.provider = provider;
+            this.stream = stream;
+            this.failure = failure;
+        }
+
         boolean succeeded() {
             return stream != null;
         }

@@ -49,16 +49,20 @@ abstract class AbstractBudgetLedger implements BudgetLedger {
      * 併發下剛好在那個瞬間進來的請求就會通過本該被擋下的檢查。
      */
     @Override
-    public final void settle(Reservation reservation, long actualMicroCents) {
+    public void settle(Reservation reservation, long actualMicroCents) {
         if (reservation == null || reservation.amountMicroCents() == 0) return;
 
         long delta = Math.max(0, actualMicroCents) - reservation.amountMicroCents();
         if (delta == 0) return;
-        applyDelta(reservation.tenant(), delta);
+        applyDelta(reservation, delta);
     }
 
-    /** 把結算差額寫回去。負值代表退回多扣的部分 */
-    protected abstract void applyDelta(String tenantKey, long delta);
+    /**
+     * 把結算差額寫回預扣當天的帳。負值代表退回多扣的部分。
+     *
+     * @param reservation 原本的預扣，決定差額要記到哪一天、哪一個租戶
+     */
+    protected abstract void applyDelta(Reservation reservation, long delta);
 
     protected static String keyFor(String tenant) {
         return tenant == null || tenant.isBlank() ? UNSPECIFIED_TENANT : tenant;

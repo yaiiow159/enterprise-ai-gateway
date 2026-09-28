@@ -2,7 +2,9 @@ package io.aigateway.server;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
@@ -25,6 +27,16 @@ public class GatewayProperties {
 
     private Rag rag = new Rag();
 
+    private Auth auth = new Auth();
+
+    public Auth getAuth() {
+        return auth;
+    }
+
+    public void setAuth(Auth auth) {
+        this.auth = auth;
+    }
+
     public Rag getRag() {
         return rag;
     }
@@ -33,8 +45,24 @@ public class GatewayProperties {
         this.rag = rag;
     }
 
-    /** 單一候選的整體逾時 */
+    /** 等到第一個 token 的期限（含對沖與失敗切換） */
     private Duration attemptTimeout = Duration.ofSeconds(60);
+
+    /**
+     * 請求沒帶 max_tokens 時套用的輸出上限。
+     *
+     * <p>OpenAI SDK 預設不帶這個欄位；直接拒絕的話「改 base URL 就能接」不成立，
+     * 放行又等於無上限生成。套一個預設值兩者都顧到，而且成本預扣仍有依據。
+     */
+    private int defaultMaxTokens = 1_024;
+
+    public int getDefaultMaxTokens() {
+        return defaultMaxTokens;
+    }
+
+    public void setDefaultMaxTokens(int defaultMaxTokens) {
+        this.defaultMaxTokens = defaultMaxTokens;
+    }
 
     public Budget getBudget() {
         return budget;
@@ -72,15 +100,43 @@ public class GatewayProperties {
         this.attemptTimeout = attemptTimeout;
     }
 
+    /**
+     * 對外 API 的身分驗證。
+     *
+     * <p>{@code apiKeys} 只接受環境變數佔位，格式為「租戶=key」，多筆以逗號分隔。
+     */
+    public static class Auth {
+        private boolean enabled = true;
+        private String apiKeys = "";
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        public String getApiKeys() { return apiKeys; }
+        public void setApiKeys(String apiKeys) { this.apiKeys = apiKeys; }
+    }
+
     public static class ProviderConfig {
         private String name;
         private String baseUrl;
         private String apiKey;
         private String model;
+        /**
+         * 對外服務的模型名稱。同一個名稱底下的 Provider 必須是同一個模型的等價部署，
+         * 對沖與失敗切換只在它們之間進行。空的話只服務 {@code model} 本身。
+         */
+        private List<String> servedModels = new ArrayList<>();
+        /** 串流開始後兩個 chunk 之間最長可以等多久；0 表示不限 */
+        private Duration streamIdleTimeout = Duration.ofSeconds(30);
         private int contextWindowTokens = 128_000;
         private int maxOutputTokens = 4_096;
         private boolean supportsStreaming = true;
         private boolean supportsTools = false;
+        private boolean supportsVision = false;
+        /**
+         * 串流時要求上游回報用量（{@code stream_options.include_usage}）。OpenAI 預設不回，
+         * 不要的話每一筆都只能靠本地估算。只有上游不認得這個參數時才關掉
+         */
+        private boolean streamUsage = true;
         private long inputMicroCentsPerToken = 50;
         private long outputMicroCentsPerToken = 150;
         private Duration connectTimeout = Duration.ofSeconds(3);
@@ -110,6 +166,14 @@ public class GatewayProperties {
         public void setConnectTimeout(Duration value) { this.connectTimeout = value; }
         public Duration getRequestTimeout() { return requestTimeout; }
         public void setRequestTimeout(Duration value) { this.requestTimeout = value; }
+        public boolean isSupportsVision() { return supportsVision; }
+        public void setSupportsVision(boolean value) { this.supportsVision = value; }
+        public boolean isStreamUsage() { return streamUsage; }
+        public void setStreamUsage(boolean value) { this.streamUsage = value; }
+        public List<String> getServedModels() { return servedModels; }
+        public void setServedModels(List<String> value) { this.servedModels = value; }
+        public Duration getStreamIdleTimeout() { return streamIdleTimeout; }
+        public void setStreamIdleTimeout(Duration value) { this.streamIdleTimeout = value; }
     }
 
     public static class Routing {
@@ -206,6 +270,11 @@ public class GatewayProperties {
     public static class Rag {
         private boolean enabled = false;
         private String collection = "docs";
+        /**
+         * 除了 {@code collection} 以外，還允許呼叫端以 {@code x_rag.collection} 指定的 collection。
+         * 每一個都會在啟動時檢查嵌入一致性；不在清單內的一律回 400。
+         */
+        private List<String> extraCollections = new ArrayList<>();
         /** 索引與查詢必須是同一個模型。啟動時會拿它跟 collection 實際記錄的比對 */
         private String embeddingModel = "fake-embed-v1";
         private int embeddingDimension = 32;
@@ -228,6 +297,16 @@ public class GatewayProperties {
         public void setEnabled(boolean enabled) { this.enabled = enabled; }
         public String getCollection() { return collection; }
         public void setCollection(String collection) { this.collection = collection; }
+        public List<String> getExtraCollections() { return extraCollections; }
+        public void setExtraCollections(List<String> v) { this.extraCollections = v; }
+
+        /** 可以被檢索的所有 collection：預設的那一個加上 extraCollections */
+        public Set<String> allowedCollections() {
+            Set<String> allowed = new LinkedHashSet<>();
+            allowed.add(collection);
+            allowed.addAll(extraCollections);
+            return allowed;
+        }
         public String getEmbeddingModel() { return embeddingModel; }
         public void setEmbeddingModel(String v) { this.embeddingModel = v; }
         public int getEmbeddingDimension() { return embeddingDimension; }

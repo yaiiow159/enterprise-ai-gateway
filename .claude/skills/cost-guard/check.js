@@ -24,6 +24,7 @@
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+const { gatewayAuthHeaders } = require('../../../tools/gateway-auth');
 
 const { findSecrets } = require('../../hooks/secret-guard.js');
 
@@ -288,7 +289,7 @@ function scanRetryDiscipline() {
 function json(port, method, urlPath, body) {
     return new Promise((resolve, reject) => {
         const payload = body === undefined ? null : JSON.stringify(body);
-        const headers = {};
+        const headers = gatewayAuthHeaders();
         if (payload) {
             headers['Content-Type'] = 'application/json';
             headers['Content-Length'] = Buffer.byteLength(payload);
@@ -340,7 +341,7 @@ async function measureCostMultiplier() {
 
     for (let index = 0; index < sampleSize; index += 1) {
         await json(GATEWAY_PORT, 'POST', '/v1/chat/completions', {
-            model: 'any',
+            model: 'fake-chat',
             messages: [{ role: 'user', content: '這是一個典型長度的提問，用來估算輸入 token。' }],
             max_tokens: 20,
         });
@@ -372,7 +373,7 @@ async function measureMaxTokensHonoured() {
     // 上游被允許產生 200 個 token：網關若漏掉 max_tokens，這裡就會看到遠超過 5 個
     await configureAll({ ttftMs: 40, tokenDelayMs: 2, tokens: 200 });
     await json(GATEWAY_PORT, 'POST', '/v1/chat/completions', {
-        model: 'any',
+        model: 'fake-chat',
         messages: [{ role: 'user', content: 'hi' }],
         max_tokens: budget,
     });
@@ -395,11 +396,12 @@ async function measureCancellationSaving() {
 
     await new Promise((resolve) => {
         const payload = JSON.stringify({
-            model: 'any', messages: [{ role: 'user', content: 'hi' }], max_tokens: budget, stream: true,
+            model: 'fake-chat', messages: [{ role: 'user', content: 'hi' }], max_tokens: budget, stream: true,
         });
         const request = http.request({
             host: 'localhost', port: GATEWAY_PORT, path: '/v1/chat/completions', method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+            headers: Object.assign(gatewayAuthHeaders(),
+                { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }),
         }, (response) => {
             let chunks = 0;
             response.on('data', () => { if (++chunks === 3) { request.destroy(); resolve(); } });
@@ -466,7 +468,7 @@ async function measureBudgetEnforcement() {
 
     const before = await gauge('gateway_budget_spent_microcents');
     await json(GATEWAY_PORT, 'POST', '/v1/chat/completions', {
-        model: 'any', messages: [{ role: 'user', content: '確認帳本有在記帳' }], max_tokens: 10,
+        model: 'fake-chat', messages: [{ role: 'user', content: '確認帳本有在記帳' }], max_tokens: 10,
     });
     const after = await gauge('gateway_budget_spent_microcents');
 

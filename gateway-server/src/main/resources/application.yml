@@ -11,8 +11,17 @@ spring:
       enabled: true
 
 gateway:
-  # 逾時要比 LLM 的正常生成時間寬鬆：長回應動輒數十秒
+  # 等到第一個 token 的期限（含對沖與失敗切換）。長 prompt 的預填階段可能要數十秒
   attempt-timeout: 60s
+  # 請求沒帶 max_tokens／max_completion_tokens 時的輸出上限（OpenAI SDK 預設不帶）
+  default-max-tokens: 1024
+
+  auth:
+    # 預設開啟；開啟卻沒有任何 key 時拒絕啟動。本機開發可設 GATEWAY_AUTH_ENABLED=false，
+    # 那時租戶改由 X-Tenant 標頭自報——正式環境不能這樣，否則租戶上限換個名字就能繞過
+    enabled: ${GATEWAY_AUTH_ENABLED:true}
+    # 格式：租戶=key，多筆以逗號分隔。key 只能從環境變數注入
+    api-keys: ${GATEWAY_API_KEYS:}
 
   routing:
     strategy: latency-aware
@@ -48,6 +57,8 @@ gateway:
     # 開之前先建索引：node tools/rag-index.js --input docs/rag-sample-kb.jsonl
     enabled: ${RAG_ENABLED:false}
     collection: ${RAG_COLLECTION:docs}
+    # 呼叫端只能檢索 collection 與這裡列出的；每一個都會在啟動時檢查嵌入一致性
+    extra-collections: []
     # 索引與查詢必須是同一個模型。啟動時會拿這兩個值跟 collection 實際記錄的比對，
     # 不符就拒絕啟動——維度相同但模型不同的話不會報錯，只是檢索結果全部不相關
     embedding-model: ${RAG_EMBEDDING_MODEL:fake-embed-v1}
@@ -59,9 +70,20 @@ gateway:
   providers:
     # 本機開發預設指向假 Provider（見 tools/fake-provider）。
     # 金鑰一律只從環境變數注入，設定檔不得出現任何金鑰字面值。
+    #
+    # served-models 是呼叫端在請求裡寫的模型名稱。同一個名稱底下的 Provider
+    # 必須是同一個模型的等價部署：對沖與失敗切換只在同一組內進行。
+    # 三個假 Provider 模擬的就是同一個模型的三個來源，所以共用 fake-chat。
+    #
+    # stream-idle-timeout：串流開始後兩個 chunk 之間最長可以等多久（預設 30s）。
+    # 上游卡住時沒有它，轉發會永遠阻塞，客戶端離開也偵測不到。
+    #
+    # supports-tools／supports-vision（預設 false）：帶 tools 或圖片的請求只會路由到宣告支援的 Provider。
+    # stream-usage（預設 true）：串流時要求上游回報用量；只有上游不認得 stream_options 時才關掉。
     - name: fake-fast
       base-url: ${FAKE_FAST_URL:http://localhost:9101}
       model: fake-fast
+      served-models: [fake-chat]
       context-window-tokens: 128000
       max-output-tokens: 4096
       input-micro-cents-per-token: 50
@@ -70,6 +92,7 @@ gateway:
     - name: fake-slow
       base-url: ${FAKE_SLOW_URL:http://localhost:9102}
       model: fake-slow
+      served-models: [fake-chat]
       context-window-tokens: 128000
       max-output-tokens: 4096
       input-micro-cents-per-token: 20
@@ -78,6 +101,7 @@ gateway:
     - name: fake-flaky
       base-url: ${FAKE_FLAKY_URL:http://localhost:9103}
       model: fake-flaky
+      served-models: [fake-chat]
       context-window-tokens: 128000
       max-output-tokens: 4096
       input-micro-cents-per-token: 10

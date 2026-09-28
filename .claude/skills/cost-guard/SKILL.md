@@ -13,6 +13,7 @@ node .claude/skills/cost-guard/check.js --requests-per-day 50000 --price-output 
 ```
 
 執行期量測需要 `dev-stack` 與網關都在跑；沒跑的話會自動略過並說明。
+網關開著 API key 驗證時，把要送的 key 放在環境變數 `GATEWAY_API_KEY`。
 
 ## 為什麼這個專案特別需要它
 

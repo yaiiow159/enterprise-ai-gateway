@@ -3,12 +3,13 @@
 OpenAI 相容的 LLM 網關：多 Provider 路由、延遲對沖、失敗切換、串流轉發、檢索增強，
 以及會真的攔截的成本上限。Spring Boot 3.5 + Java 21 虛擬執行緒。
 
-現有的 SDK 只要改 base URL 就能接進來。
+現有的 SDK 只要改 base URL、換成網關核發的 API key 就能接進來。
 
 ```bash
 curl http://localhost:8090/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"any","messages":[{"role":"user","content":"hi"}],"max_tokens":50,"stream":true}'
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -d '{"model":"fake-chat","messages":[{"role":"user","content":"hi"}],"max_tokens":50,"stream":true}'
 ```
 
 ---
@@ -25,9 +26,26 @@ node .claude/skills/dev-stack/up.js
 mvn clean install -DskipTests
 ```
 
+先產生一把 key（至少 24 字元），放進環境變數 `GATEWAY_API_KEY`：
+
 ```bash
-java -jar gateway-server/target/gateway-server-0.0.1-SNAPSHOT.jar
+openssl rand -hex 24
 ```
+
+```bash
+GATEWAY_API_KEYS="local-dev=${GATEWAY_API_KEY}" java -jar gateway-server/target/gateway-server-0.0.1-SNAPSHOT.jar
+```
+
+網關預設要求 API key，沒有設定任何 key 會**拒絕啟動**。`GATEWAY_API_KEYS` 的格式是
+`租戶=key`，多筆以逗號分隔，同一個租戶可以有多把 key（輪替時新舊並存）。
+租戶由 key 決定，不接受客戶端自報。只在本機開發時可以用 `GATEWAY_AUTH_ENABLED=false` 停用，
+那時租戶改由 `X-Tenant` 標頭自報。
+
+`tools/` 與 `.claude/skills/` 裡的腳本從 `GATEWAY_API_KEY` 讀要送的 key；
+會自己啟動網關的腳本（`release-check`、`bench`、`verify-*`）則每次產生一把臨時 key。
+
+請求裡的 `model` 必須是某個 Provider 在 `served-models` 宣告的名稱，否則回 404。
+本機設定的三個假 Provider 共同服務 `fake-chat`。
 
 | 服務 | 位址 |
 | --- | --- |
@@ -54,7 +72,7 @@ node tools/rag-index.js --input docs/rag-sample-kb.jsonl --collection docs
 
 ```json
 {
-  "model": "any",
+  "model": "fake-chat",
   "messages": [{"role": "user", "content": "token bucket rate limit"}],
   "max_tokens": 200,
   "x_rag": {"collection": "docs", "top_k": 3, "degrade_on_failure": false}
@@ -142,7 +160,7 @@ node .claude/skills/bench/bench.js --concurrency 100 --rounds 3 --upstream-ttft 
 
 ## 目前還沒有的東西
 
-- **沒有任何 JUnit 測試**，驗證全部是端到端的 Node 腳本
+- 網關只轉送工具呼叫，不執行工具；非串流請求在客戶端離線後仍會生成到結束（要能取消請用串流）
 - 沒有語意快取、沒有工作流編排
 - 沒有後台管理頁面（觀測用 Grafana，改設定要重啟）
 - PostgreSQL 在 `dev-stack` 裡但應用未使用

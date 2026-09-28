@@ -17,6 +17,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Set;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.aigateway.core.ChatChunk;
@@ -24,8 +28,10 @@ import io.aigateway.core.ChatRequest;
 import io.aigateway.core.ChatResponse;
 import io.aigateway.core.ChatStream;
 import io.aigateway.core.LlmProvider;
+import io.aigateway.core.Message;
 import io.aigateway.core.ModelCapability;
 import io.aigateway.core.ProviderException;
+import io.aigateway.core.TokenEstimator;
 import io.aigateway.core.Usage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,23 +54,39 @@ public class OpenAiCompatibleProvider implements LlmProvider {
     private final URI endpoint;
     private final String apiKey;
     private final String model;
+    private final Set<String> servedModels;
     private final ModelCapability capability;
     private final HttpClient httpClient;
     private final Duration requestTimeout;
+    private final Duration streamIdleTimeout;
+    private final boolean requestStreamUsage;
 
+    /**
+     * @param model              送給上游的模型名稱
+     * @param servedModels       對外服務的模型名稱；空的話只服務 {@code model} 本身
+     * @param requestTimeout     等到回應標頭為止的逾時（JDK HttpClient 的語意，不含讀取內容）
+     * @param streamIdleTimeout  串流開始後兩個 chunk 之間最長可以等多久；0 表示不限
+     * @param requestStreamUsage 串流時送 {@code stream_options.include_usage}，要求上游回報用量
+     */
     public OpenAiCompatibleProvider(String name,
                                     String baseUrl,
                                     String apiKey,
                                     String model,
+                                    Set<String> servedModels,
                                     ModelCapability capability,
                                     Duration connectTimeout,
-                                    Duration requestTimeout) {
+                                    Duration requestTimeout,
+                                    Duration streamIdleTimeout,
+                                    boolean requestStreamUsage) {
         this.name = name;
         this.endpoint = URI.create(baseUrl.replaceAll("/+$", "") + "/v1/chat/completions");
         this.apiKey = apiKey;
         this.model = model;
+        this.servedModels = servedModels == null || servedModels.isEmpty() ? Set.of(model) : Set.copyOf(servedModels);
         this.capability = capability;
         this.requestTimeout = requestTimeout;
+        this.streamIdleTimeout = streamIdleTimeout;
+        this.requestStreamUsage = requestStreamUsage;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(connectTimeout)
                 .followRedirects(HttpClient.Redirect.NEVER)
@@ -79,6 +101,11 @@ public class OpenAiCompatibleProvider implements LlmProvider {
     @Override
     public ModelCapability capability() {
         return capability;
+    }
+
+    @Override
+    public Set<String> servedModels() {
+        return servedModels;
     }
 
     @Override
@@ -105,7 +132,15 @@ public class OpenAiCompatibleProvider implements LlmProvider {
                 choice.path("message").path("content").asText(""),
                 finishReason(choice.path("finish_reason").asText(null)),
                 parseUsage(root.path("usage"), capability, request.estimatedPromptTokens(), -1),
-                Duration.ofNanos(System.nanoTime() - startedAt).toMillis());
+                Duration.ofNanos(System.nanoTime() - startedAt).toMillis(),
+                toolCalls(choice.path("message").path("tool_calls")));
+    }
+
+    /** OpenAI 的 tool_calls 陣列原樣轉成 Map，網關不解讀也不執行 */
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> toolCalls(JsonNode node) {
+        if (node == null || !node.isArray() || node.isEmpty()) return null;
+        return ProviderJson.mapper().convertValue(node, List.class);
     }
 
     @Override
@@ -123,22 +158,21 @@ public class OpenAiCompatibleProvider implements LlmProvider {
             throw toProviderException(response.statusCode(), body);
         }
 
-        return new SseChatStream(name, response.body(), capability, request.estimatedPromptTokens());
+        return new SseChatStream(name, response.body(), capability, request.estimatedPromptTokens(),
+                streamIdleTimeout);
     }
 
     private HttpRequest buildRequest(ChatRequest request, boolean streaming) {
-        Map<String, Object> payload = new LinkedHashMap<>();
+        // 透傳欄位先放，網關決定的欄位後放：就算白名單哪天放進了 model 或 max_tokens，
+        // 也不可能蓋掉路由選定的模型或成本預扣所依據的輸出上限
+        Map<String, Object> payload = new LinkedHashMap<>(request.extra());
         payload.put("model", model);
-        payload.put("messages", request.messages().stream()
-                .map(message -> Map.of(
-                        "role", message.role().name().toLowerCase(),
-                        "content", message.content()))
-                .toList());
+        payload.put("messages", request.messages().stream().map(Message::toWire).toList());
         // max_tokens 一定會送出：ChatRequest 在建構時就強制要求，這裡不需要再判斷 null
         payload.put("max_tokens", request.maxTokens());
         payload.put("stream", streaming);
+        if (streaming && requestStreamUsage) payload.put("stream_options", Map.of("include_usage", true));
         if (request.temperature() != null) payload.put("temperature", request.temperature());
-        payload.putAll(request.extra());
 
         HttpRequest.Builder builder = HttpRequest.newBuilder(endpoint)
                 .timeout(requestTimeout)
@@ -159,12 +193,7 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         return new ProviderException(name, kind, 502, String.valueOf(error.getMessage()), error);
     }
 
-    /**
-     * HTTP 狀態碼轉成分類過的錯誤。
-     *
-     * <p>分類的目的是決定「值不值得換一家再試」：429 與 5xx 值得，
-     * 400 與 401 換誰都一樣，重試只是多付一次錢又多等一次。
-     */
+    /** HTTP 狀態碼轉成分類過的錯誤，分類規則見 {@link ProviderException#kindForHttpStatus} */
     private ProviderException toProviderException(int status, String body) {
         return new ProviderException(name, ProviderException.kindForHttpStatus(status), status,
                 extractErrorMessage(body), null);
@@ -250,24 +279,49 @@ public class OpenAiCompatibleProvider implements LlmProvider {
      */
     static final class SseChatStream implements ChatStream {
 
+        /**
+         * 所有串流共用的閒置計時器。只負責在逾時時關閉串流，工作量極小，一條執行緒就夠。
+         * 取消的計時要立刻移出佇列，否則每個 chunk 都留下一筆，長串流會把佇列撐大。
+         */
+        private static final ScheduledThreadPoolExecutor WATCHDOG = createWatchdog();
+
         private final String providerName;
         private final InputStream source;
         private final BufferedReader reader;
         private final ModelCapability capability;
         private final long promptEstimate;
+        private final Duration idleTimeout;
 
         private ChatChunk nextChunk;
         private boolean finished;
         /** 上游有沒有自己回報用量。沒有的話結束前要補一個，否則這次呼叫的成本會是 0 */
         private boolean usageReported;
         private long contentChunks;
+        /** 已收到的輸出文字（含工具呼叫的參數），上游沒回用量時據此估算輸出 token */
+        private final TokenEstimator completionText = new TokenEstimator();
+        /** 讀出第一個 chunk 之後才開始計算閒置；第一個 chunk 之前由對沖賽跑的期限負責 */
+        private boolean started;
+        private volatile boolean idleTimedOut;
 
-        SseChatStream(String providerName, InputStream source, ModelCapability capability, long promptEstimate) {
+        /** @param idleTimeout 兩個 chunk 之間最長可以等多久；0 或負值表示不限 */
+        SseChatStream(String providerName, InputStream source, ModelCapability capability, long promptEstimate,
+                      Duration idleTimeout) {
             this.providerName = providerName;
             this.source = source;
             this.capability = capability;
             this.promptEstimate = promptEstimate;
+            this.idleTimeout = idleTimeout == null ? Duration.ZERO : idleTimeout;
             this.reader = new BufferedReader(new InputStreamReader(source, StandardCharsets.UTF_8));
+        }
+
+        private static ScheduledThreadPoolExecutor createWatchdog() {
+            ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, runnable -> {
+                Thread thread = new Thread(runnable, "sse-idle-watchdog");
+                thread.setDaemon(true);
+                return thread;
+            });
+            executor.setRemoveOnCancelPolicy(true);
+            return executor;
         }
 
         @Override
@@ -291,7 +345,38 @@ public class OpenAiCompatibleProvider implements LlmProvider {
             return chunk;
         }
 
+        /**
+         * 讀下一個 chunk，串流開始後加上閒置逾時。
+         *
+         * <p>JDK HttpClient 的請求逾時只管到回應標頭，讀內容時沒有逾時。上游吐出第一個 token 後
+         * 若卡住，讀取會永遠阻塞：轉發執行緒停在這裡，客戶端離開也偵測不到
+         * （斷線只有在下一次寫出時才會被發現），上游連線就一直開著。
+         * 逾時時關閉底層串流，阻塞中的讀取會隨之結束。
+         */
         private ChatChunk readNext() {
+            ScheduledFuture<?> watchdog = started && idleTimeout.toMillis() > 0
+                    ? WATCHDOG.schedule(this::onIdleTimeout, idleTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                    : null;
+            try {
+                ChatChunk chunk = readNextUnguarded();
+                if (chunk != null) started = true;
+                return chunk;
+            } finally {
+                if (watchdog != null) watchdog.cancel(false);
+            }
+        }
+
+        private void onIdleTimeout() {
+            idleTimedOut = true;
+            closeSource();
+        }
+
+        private ProviderException idleTimeoutError(Throwable cause) {
+            return new ProviderException(providerName, ProviderException.Kind.STREAM_ABORTED, 504,
+                    "串流閒置超過 %d 毫秒，已中止".formatted(idleTimeout.toMillis()), cause);
+        }
+
+        private ChatChunk readNextUnguarded() {
             try {
                 String line;
                 while ((line = reader.readLine()) != null) {
@@ -308,21 +393,29 @@ public class OpenAiCompatibleProvider implements LlmProvider {
                     JsonNode root = ProviderJson.readTree(providerName, payload, "串流 chunk");
                     JsonNode choice = root.path("choices").path(0);
                     String delta = choice.path("delta").path("content").asText("");
+                    List<Map<String, Object>> toolCalls = toolCalls(choice.path("delta").path("tool_calls"));
                     ChatChunk.FinishReason reason = finishReason(choice.path("finish_reason").asText(null));
+
+                    if (!delta.isEmpty()) contentChunks += 1;
+                    completionText.add(delta);
+                    if (toolCalls != null) {
+                        choice.path("delta").path("tool_calls").findValues("arguments")
+                                .forEach(arguments -> completionText.add(arguments.asText("")));
+                    }
 
                     Usage usage = null;
                     if (root.has("usage") && !root.path("usage").isNull()) {
-                        usage = parseUsage(root.path("usage"), capability, promptEstimate, contentChunks);
+                        usage = parseUsage(root.path("usage"), capability, promptEstimate, completionEstimate());
                         usageReported = true;
                     }
-                    if (!delta.isEmpty()) contentChunks += 1;
 
                     // 結束標記本身通常沒有內容，但帶著 usage，仍要往下傳
-                    if (delta.isEmpty() && reason == null && usage == null) continue;
-                    return new ChatChunk(delta, reason, usage, providerName);
+                    if (delta.isEmpty() && toolCalls == null && reason == null && usage == null) continue;
+                    return new ChatChunk(delta, reason, usage, providerName, toolCalls);
                 }
-            } catch (IOException error) {
+            } catch (IOException | UncheckedIOException error) {
                 finished = true;
+                if (idleTimedOut) throw idleTimeoutError(error);
                 // 串流中途斷線：已經送出的內容無法收回，只能讓呼叫端知道它是不完整的
                 throw new ProviderException(providerName, ProviderException.Kind.STREAM_ABORTED, 502,
                         "串流在結束前中斷：" + error.getMessage(), error);
@@ -330,22 +423,32 @@ public class OpenAiCompatibleProvider implements LlmProvider {
 
             // 讀到 EOF 卻沒看到 [DONE]，同樣是不完整的串流
             finished = true;
+            if (idleTimedOut) throw idleTimeoutError(null);
             throw new ProviderException(providerName, ProviderException.Kind.STREAM_ABORTED, 502,
                     "上游在送出結束標記前就關閉連線", null);
         }
 
         /**
+         * 輸出 token 的估算：依收到的文字估，且不少於 chunk 數。
+         *
+         * <p>不能只數 chunk：有些後端一個 chunk 帶好幾個 token，只數 chunk 會少算。
+         */
+        private long completionEstimate() {
+            return Math.max(contentChunks, completionText.tokens());
+        }
+
+        /**
          * 上游沒回用量時，用本地估算補一個。
          *
-         * <p>OpenAI 的串流預設**不回** usage，要另外送 {@code stream_options.include_usage}。
-         * 本專案的假 Provider 一律會回，所以這條路徑在假 Provider 上永遠走不到——
-         * 這正是測試替身造成的盲點：替身比真貨慷慨，程式碼就理所當然地依賴那份慷慨。
-         * 假 Provider 因此加了 {@code omitUsage} 設定來重現真貨的這個限制。
+         * <p>網關預設會送 {@code stream_options.include_usage} 要求上游回報；
+         * 這裡兜的是上游不支援那個參數、或設定關掉了的情況。
+         * 假 Provider 有 {@code omitUsage} 設定來重現這個限制——替身比真貨慷慨的話，
+         * 程式碼就會理所當然地依賴那份慷慨。
          */
         private ChatChunk syntheticUsageChunk() {
             usageReported = true;
             Usage estimated = parseUsage(ProviderJson.mapper().createObjectNode(),
-                    capability, promptEstimate, contentChunks);
+                    capability, promptEstimate, completionEstimate());
             log.debug("{} 未回報用量，以本地估算補上：輸入 {}、輸出 {} token",
                     providerName, estimated.promptTokens(), estimated.completionTokens());
             return new ChatChunk("", null, estimated, providerName);
@@ -355,6 +458,10 @@ public class OpenAiCompatibleProvider implements LlmProvider {
         public void close() {
             finished = true;
             nextChunk = null;
+            closeSource();
+        }
+
+        private void closeSource() {
             try {
                 // 關閉 InputStream 即中止 HTTP 交換，上游會停止產生 token。
                 // 這一行就是「使用者離開後不再付錢」的實際機制

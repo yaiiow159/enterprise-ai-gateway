@@ -12,7 +12,8 @@ import java.util.Map;
  * @param stream     是否串流
  * @param temperature 取樣溫度，null 表示用 Provider 預設
  * @param tenant     成本歸戶用的租戶／團隊識別
- * @param extra      直接透傳給 Provider 的額外參數
+ * @param extra      透傳給 Provider 的額外參數（tools、response_format 等）。
+ *                   只能放白名單內的欄位，而且不會覆蓋 model、messages、max_tokens、stream
  */
 public record ChatRequest(
         String model,
@@ -43,10 +44,21 @@ public record ChatRequest(
         return new ChatRequest(model, messages, maxTokens, streaming, temperature, tenant, extra);
     }
 
-    /** 估算輸入 token 數。用於在送出前擋掉超過上下文長度的請求（見 CLAUDE.md 的待釐清問題 1）*/
+    /** 請求是否帶了工具定義 */
+    public boolean usesTools() {
+        return extra.get("tools") instanceof List<?> tools && !tools.isEmpty();
+    }
+
+    /** 是否有任何訊息帶圖片 */
+    public boolean hasImages() {
+        return messages.stream().anyMatch(Message::hasImages);
+    }
+
+    /** 估算輸入 token 數，刻意偏高（見 {@link TokenEstimator}）。用於上下文檢查與成本預扣 */
     public int estimatedPromptTokens() {
-        int characters = messages.stream().mapToInt(message -> message.content().length()).sum();
-        // 近似值：英文約 4 字元／token，中日韓更接近 1.5。取保守的 2 以免低估而漏擋
-        return Math.max(1, characters / 2);
+        long tokens = messages.stream()
+                .mapToLong(message -> message.estimatedTokens() + TokenEstimator.PER_MESSAGE_OVERHEAD)
+                .sum();
+        return (int) Math.min(Integer.MAX_VALUE, Math.max(1, tokens));
     }
 }

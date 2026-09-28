@@ -2,6 +2,8 @@ package io.aigateway.server;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -11,6 +13,7 @@ import io.aigateway.core.ChatStream;
 import io.aigateway.core.HedgingChatClient;
 import io.aigateway.core.Message;
 import io.aigateway.core.ProviderException;
+import io.aigateway.core.ProviderRegistry;
 import io.aigateway.core.RagAugmenter;
 import io.aigateway.core.RagOptions;
 import org.slf4j.Logger;
@@ -20,9 +23,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestAttribute;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
@@ -50,18 +54,32 @@ public class ChatController {
     private static final long EMBEDDING_COST_PER_TOKEN_GUESS = 100;
 
     private final HedgingChatClient client;
+    private final ProviderRegistry registry;
+    private final int defaultMaxTokens;
     /** 沒開啟 RAG 時為 null——沒有索引的檢索只會多付一次嵌入費用然後回傳空結果 */
     private final RagAugmenter rag;
 
-    ChatController(HedgingChatClient client, ObjectProvider<RagAugmenter> rag) {
+    ChatController(HedgingChatClient client, ProviderRegistry registry, GatewayProperties properties,
+                   ObjectProvider<RagAugmenter> rag) {
         this.client = client;
+        this.registry = registry;
+        this.defaultMaxTokens = properties.getDefaultMaxTokens();
         this.rag = rag.getIfAvailable();
+    }
+
+    /** 列出可以在 {@code model} 欄位使用的名稱，也就是各 Provider 宣告的 served-models */
+    @GetMapping(path = "/v1/models", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Map<String, Object> models() {
+        Set<String> models = new TreeSet<>();
+        registry.all().forEach(provider -> models.addAll(provider.servedModels()));
+        return OpenAiPayloads.toModelList(models);
     }
 
     @PostMapping(path = "/v1/chat/completions", produces = MediaType.APPLICATION_JSON_VALUE)
     public Object chatCompletions(@RequestBody Map<String, Object> body,
-                                  @RequestHeader(value = "X-Tenant", required = false) String tenant) {
-        ChatRequest request = OpenAiPayloads.toChatRequest(body, tenant);
+                                  @RequestAttribute(name = ApiKeyAuthFilter.TENANT_ATTRIBUTE, required = false)
+                                  String tenant) {
+        ChatRequest request = OpenAiPayloads.toChatRequest(body, tenant, defaultMaxTokens);
 
         // 檢索**必須在這裡**，也就是在 client 的成本預扣之前。
         // 預扣用 estimatedPromptTokens() 估算，而檢索會往 prompt 塞進成千個 token；
@@ -136,7 +154,7 @@ public class ChatController {
                 while (upstream.hasNext()) {
                     ChatChunk chunk = upstream.next();
                     emitter.send(SseEmitter.event()
-                            .data(json(OpenAiPayloads.toChunk(chunk, request, first ? retrieval : null)),
+                            .data(json(OpenAiPayloads.toChunk(chunk, request, first, first ? retrieval : null)),
                                     MediaType.APPLICATION_JSON));
                     first = false;
                 }
@@ -190,8 +208,10 @@ public class ChatController {
             // 額度用盡沿用 429：對客戶端而言「現在不要再送了」的處理方式是一樣的，
             // 差別在 type 欄位（insufficient_quota），與 OpenAI 的語意一致
             case BUDGET_EXCEEDED -> HttpStatus.TOO_MANY_REQUESTS;
-            case AUTHENTICATION -> HttpStatus.UNAUTHORIZED;
+            // 上游拒絕的是網關自己的金鑰，不是客戶端的——回 401 會讓客戶端以為自己的 key 錯了
+            case AUTHENTICATION, UPSTREAM_NOT_FOUND -> HttpStatus.BAD_GATEWAY;
             case BAD_REQUEST, CONTENT_FILTERED -> HttpStatus.BAD_REQUEST;
+            case MODEL_NOT_FOUND -> HttpStatus.NOT_FOUND;
             case TIMEOUT -> HttpStatus.GATEWAY_TIMEOUT;
             default -> HttpStatus.BAD_GATEWAY;
         };
